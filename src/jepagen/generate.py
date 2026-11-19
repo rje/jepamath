@@ -74,7 +74,7 @@ def _work(args):
 
 
 def generate(template: Template, manifest: Manifest, split: str, seeds: range, out_dir: str, backend: str = "mujoco",
-             twins: bool = False, workers: int = 4, max_render_fps: float = 30.0, temp_ceiling_c: float = 83.0,
+             twins: bool = False, workers: int = 4, max_render_fps: float = 60.0, temp_ceiling_c: float = 83.0,
              est_bytes_per_clip: int = 400_000) -> dict:
     os.makedirs(out_dir, exist_ok=True)
     n_clips = len(seeds) * (2 if twins else 1)

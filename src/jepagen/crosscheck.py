@@ -19,7 +19,7 @@ def _semantics(clip):
 
 
 def crosscheck(template: Template, manifest: Manifest, split: str, seeds, out_dir: str,
-               backends=("mujoco", "rust"), max_render_fps: float = 30.0) -> list[dict]:
+               backends=("mujoco", "rust"), max_render_fps: float = 60.0) -> list[dict]:
     lim = RenderLimiter(os.path.join(out_dir, ".render_limiter"), max_render_fps)
     rows = []
     for seed in seeds:

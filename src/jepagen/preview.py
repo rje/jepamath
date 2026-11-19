@@ -20,7 +20,7 @@ def _label(frames: np.ndarray, color) -> np.ndarray:
 
 
 def preview(template: Template, manifest: Manifest, split: str, seeds, out_dir: str, backend: str = "mujoco",
-            max_render_fps: float = 30.0, scale: int = 3) -> list[str]:
+            max_render_fps: float = 60.0, scale: int = 3) -> list[str]:
     os.makedirs(out_dir, exist_ok=True)
     lim = RenderLimiter(os.path.join(out_dir, ".render_limiter"), max_render_fps)
     lines = []

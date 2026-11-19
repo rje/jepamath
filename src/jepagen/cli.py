@@ -14,7 +14,7 @@ def _common(p):
     p.add_argument("--manifest", default=None, help="split manifest YAML (default: built-in)")
     p.add_argument("--split", default="train")
     p.add_argument("--backend", default="mujoco", choices=["mujoco", "rust"])
-    p.add_argument("--max-render-fps", type=float, default=30.0,
+    p.add_argument("--max-render-fps", type=float, default=60.0,
                    help="TOTAL GPU renders per second across all workers")
 
 

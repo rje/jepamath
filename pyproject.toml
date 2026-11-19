@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jepagen"
+version = "0.1.0"
+description = "Procedural video data generator for JEPA number-sense experiments"
+requires-python = ">=3.11"
+dependencies = ["mujoco>=3.2", "numpy", "pydantic>=2", "pyyaml", "webdataset", "pyarrow", "scikit-learn", "imageio", "pillow"]
+
+[project.scripts]
+jepagen = "jepagen.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

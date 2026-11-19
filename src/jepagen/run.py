@@ -43,3 +43,45 @@ def run_episode(ep: Episode, backend: str, limiter) -> tuple[ClipResult, dict]:
         return clip, {"max_penetration": max_pen, "backend": backend}
     finally:
         b.close()
+
+
+def run_episodes_batched(eps: list[Episode], limiter) -> list[tuple[ClipResult, dict]]:
+    """Rust engine only: runs N episodes in lockstep and renders each frame of all N in ONE GPU
+    submission (one limiter slot). Frame i of episode j is identical to `run_episode`'s output."""
+    import jepamath_engine
+
+    from .backends.rust_backend import RustBackend
+
+    if not eps:
+        raise ValueError("no episodes")
+    if len(eps) > jepamath_engine.max_batch():
+        raise ValueError(f"batch of {len(eps)} exceeds engine max {jepamath_engine.max_batch()}")
+    clip0 = eps[0].clip
+    if any(e.clip != clip0 for e in eps):
+        raise ValueError("batched episodes must share the clip spec (frame times and size)")
+    bs = [RustBackend(e, limiter) for e in eps]
+    n = len(eps)
+    frames = [[] for _ in range(n)]
+    segs = [[] for _ in range(n)]
+    states = [[] for _ in range(n)]
+    max_pen = [0.0] * n
+    applied = [e.violation is None for e in eps]
+    for t in clip0.frame_times():
+        for j, (e, b) in enumerate(zip(eps, bs)):
+            if not applied[j] and e.violation.t <= t:
+                b.step_to(e.violation.t)
+                b.apply_violation()
+                applied[j] = True
+            b.step_to(t)
+            max_pen[j] = max(max_pen[j], b.penetration())
+            states[j].append(b.frame_state())
+        limiter.acquire()
+        rgb, seg = jepamath_engine.render_batch([b.eng for b in bs])
+        for j in range(n):
+            frames[j].append(rgb[j])
+            segs[j].append(seg[j])
+    if not all(applied):
+        raise RuntimeError("violation time past the last frame")
+    return [(ClipResult(episode=e, frames=np.stack(frames[j]), seg=np.stack(segs[j]), states=states[j],
+                        events=list(bs[j].events)),
+             {"max_penetration": max_pen[j], "backend": "rust"}) for j, e in enumerate(eps)]

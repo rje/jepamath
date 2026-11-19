@@ -35,6 +35,8 @@ def main(argv=None):
     g.add_argument("--workers", type=int, default=4)
     g.add_argument("--twins", action="store_true", help="also generate impossible twins (separate shards)")
     g.add_argument("--temp-ceiling", type=float, default=83.0)
+    g.add_argument("--batch", type=int, default=1,
+                   help="scenes rendered per GPU submission (rust backend; max 64). Each submission takes one --max-render-fps slot")
 
     pv = sub.add_parser("preview")
     _common(pv)
@@ -59,7 +61,7 @@ def main(argv=None):
         from .generate import generate
         t, m = _load(args)
         print(json.dumps(generate(t, m, args.split, range(*args.seeds), args.out, args.backend, args.twins,
-                                  args.workers, args.max_render_fps, args.temp_ceiling)))
+                                  args.workers, args.max_render_fps, args.temp_ceiling, batch=args.batch)))
     elif args.cmd == "preview":
         from .preview import preview
         t, m = _load(args)

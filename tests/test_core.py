@@ -72,3 +72,20 @@ def test_limiter_caps_rate(tmp_path):
     for _ in range(26):
         lim.acquire()
     assert time.monotonic() - t0 >= 0.48
+
+
+def test_batched_render_matches_unbatched(tmp_path):
+    """A clip rendered inside a batch must be pixel-identical to the same clip rendered alone."""
+    from jepagen.run import run_episodes_batched
+
+    lim = RenderLimiter(str(tmp_path / "lim"), max_fps=1000)
+    t, m = Template(), Manifest()
+    eps = [sample_episode(t, m, "train", s) for s in range(3)]
+    eps += [make_twin(e, s) for e, s in zip(eps, range(3))]
+    batched = run_episodes_batched(eps, lim)
+    for ep, (bclip, bdiag) in zip(eps, batched):
+        clip, diag = run_episode(ep, "rust", lim)
+        assert np.array_equal(clip.frames, bclip.frames), ep.episode_id
+        assert np.array_equal(clip.seg, bclip.seg), ep.episode_id
+        assert diag["max_penetration"] == bdiag["max_penetration"]
+        assert clip.states == bclip.states

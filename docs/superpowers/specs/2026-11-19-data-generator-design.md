@@ -43,7 +43,7 @@ The generator has two simulation backends behind one interface:
 
 - Machine: RTX 6000 Ada (48 GB), 48 CPU cores, 91 GB RAM, headless Vulkan 1.4 available, Rust 1.99, conda.
 - Disk: 435 GB free on /home. 1M clips × 16 × 128² × 3 B ≈ 790 GB raw — does not fit. Default target is **100k clips (~79 GB raw, less as PNG)**; the shard writer checks free space before writing and refuses if the run would leave < 50 GB free.
-- Python env: a new conda env `jepamath` (Python 3.11), leaving `base` untouched. PyTorch is not needed by the generator; it is installed later for training.
+- Python env: the existing conda `base` env (user's choice); packages added there with no upgrades to existing ones.
 
 ## Approaches considered (Rust engine)
 
@@ -187,12 +187,18 @@ Rust work can run in parallel with steps 3–6 once the spec (step 2) is fixed.
 
 ## Builder's calls (made in this design, open to correction)
 
-- New `jepamath` conda env instead of `base`.
 - Total render cap 30 fps default, global across workers, plus a temperature pause at 83 °C.
 - 100k-clip default target given disk space.
 - Uniform count distribution as default.
-- Clip defaults: 16 frames at 4 fps, 128px, physics at 240 Hz.
+- Clip defaults: 32 frames at 4 fps (8 s), 128px, physics at 240 Hz; transfers 1.6–2.0 s (faster claw moves made objects bounce out).
 
 ## Left to the builder
 
 Crate and package versions; exact MJCF construction; claw grasp mechanism details; jitter/interpenetration thresholds (tune on preview clips); shard size; feature list details in the audit beyond those named.
+
+## Implementation notes (2026-11-19)
+
+- Shared mechanics rules live in `src/jepagen/backends/base.py` and are ported line for line to `engine/src/rules.rs`: topmost-object pick, drop-spot grid rule (also used to place a hidden "add"), nominal release height, screen motion, region classification.
+- Rust engine: the held object is switched to kinematic and carried at a fixed offset (a rapier fixed joint sagged and pressed objects into the pile). rapier has no rolling friction; angular damping 2.0 stands in.
+- `jepagen crosscheck` compares count-per-region per frame and the grasp/release/violation event sequence across backends.
+- MuJoCo renders colour and segmentation separately (segmentation without MSAA, which otherwise blends id colours at edges); each render takes a limiter slot. The Rust engine renders both in one submission and takes one slot.

@@ -32,6 +32,8 @@ def main():
     sub.choices["twins"].add_argument("--data", required=True)
     sub.choices["twins"].add_argument("--split", default="train")
     sub.choices["twins"].add_argument("--n", type=int, default=500)
+    sub.choices["twins"].add_argument("--protocol", choices=("windows", "reveal"), default="windows",
+                                      help="windows: Garrido sliding windows; reveal: whole-clip, reveal-locked")
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
@@ -46,8 +48,8 @@ def main():
         from .intphys import evaluate
         r = evaluate(a.root, sj, max_scenes=a.max_scenes, frame_step=a.frame_step)
     else:
-        from .twins import evaluate
-        r = evaluate(a.data, a.split, sj, a.n)
+        from .twins import evaluate, evaluate_reveal
+        r = (evaluate if a.protocol == "windows" else evaluate_reveal)(a.data, a.split, sj, a.n)
     r["metrics"]["guard"] = guard.summary()
     r["metrics"]["seconds"] = round(time.monotonic() - t0, 1)
     r["metrics"]["model"] = a.model

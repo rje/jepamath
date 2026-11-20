@@ -18,14 +18,14 @@ from PIL import Image
 
 from .vjepa import VJepaSurprise
 
-FRAME_STEP = 2
-N_FRAMES = 99 // FRAME_STEP
+FRAME_STEP = 2   # Garrido's default
 
 
-def load_movie(path: str) -> np.ndarray:
+def load_movie(path: str, frame_step: int = FRAME_STEP) -> np.ndarray:
     frames = sorted(os.listdir(os.path.join(path, "scene")))
     out = []
-    for f in frames[: N_FRAMES * FRAME_STEP: FRAME_STEP]:
+    n = 99 // frame_step
+    for f in frames[: n * frame_step: frame_step]:
         im = Image.open(os.path.join(path, "scene", f))
         if im.mode not in ("RGB", "RGBA"):
             raise ValueError(f"unexpected image mode {im.mode} in {path}/{f}")
@@ -55,7 +55,7 @@ def _matches(movies: list[np.ndarray]) -> list[tuple[int, int]]:
 
 
 def evaluate(root: str, sj: VJepaSurprise, blocks=("O1", "O2", "O3"), context_lengths=(2, 4, 6, 8, 10),
-             max_scenes: int | None = None, log=print) -> dict:
+             max_scenes: int | None = None, frame_step: int = FRAME_STEP, log=print) -> dict:
     res = {}
     raw = {}
     for block in blocks:
@@ -64,7 +64,7 @@ def evaluate(root: str, sj: VJepaSurprise, blocks=("O1", "O2", "O3"), context_le
         pairs = []   # (loss_possible [C, W], loss_impossible [C, W])
         for si, scene in enumerate(scenes):
             paths = [os.path.join(bdir, scene, str(k)) for k in (1, 2, 3, 4)]
-            movies = [load_movie(p) for p in paths]
+            movies = [load_movie(p, frame_step) for p in paths]
             labels = [is_possible(p) for p in paths]
             losses = [sj.window_losses(sj.preprocess(m), context_lengths) for m in movies]
             for a, b in _matches(movies):

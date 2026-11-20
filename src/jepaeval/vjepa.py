@@ -83,6 +83,7 @@ class _SurpriseBase:
     res: int
     grid: int
     max_window: int | None = None
+    tubelet: int = TUBELET
 
     def _setup(self, device, precision, guard, window_batch):
         self.autocast = _check_precision(precision)
@@ -110,7 +111,7 @@ class _SurpriseBase:
                       stride: int = 2) -> torch.Tensor:
         """video: preprocessed [3, T, res, res]. Returns [len(context_lengths), n_windows] surprise.
         Window w covers frames [w*stride, w*stride + window)."""
-        if window % TUBELET or any(c % TUBELET or not 0 < c < window for c in context_lengths):
+        if window % self.tubelet or any(c % self.tubelet or not 0 < c < window for c in context_lengths):
             raise ValueError("window and context lengths must be multiples of the tubelet size, 0 < ctx < window")
         if self.max_window is not None and window != self.max_window:
             raise ValueError(f"this model takes exactly {self.max_window}-frame windows")
@@ -133,16 +134,16 @@ class _SurpriseBase:
     def slot_losses(self, video: torch.Tensor, ctx: int) -> torch.Tensor:
         """One window = the whole preprocessed clip [3, T, res, res]; the context is its first `ctx` frames.
         Returns [n_target_slots] surprise per predicted time slot (tubelet), slot j covering frames
-        [ctx + 2j, ctx + 2j + 2)."""
+        [ctx + j*tubelet, ctx + (j+1)*tubelet)."""
         T = video.shape[1]
         if self.max_window is not None and T != self.max_window:
             raise ValueError(f"this model takes exactly {self.max_window}-frame clips, got {T}")
-        if T % TUBELET or ctx % TUBELET or not 0 < ctx < T:
+        if T % self.tubelet or ctx % self.tubelet or not 0 < ctx < T:
             raise ValueError(f"bad clip/context: T={T} ctx={ctx}")
         with self.guard, torch.autocast("cuda", dtype=self.autocast or torch.float16,
                                         enabled=self.autocast is not None):
             tok = self._batch(video.unsqueeze(0), ctx).float()[0]
-        return tok.view((T - ctx) // TUBELET, self.grid * self.grid).mean(1).cpu()
+        return tok.view((T - ctx) // self.tubelet, self.grid * self.grid).mean(1).cpu()
 
 
 class VJepaSurprise(_SurpriseBase):

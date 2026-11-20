@@ -115,3 +115,24 @@ def test_control_twins_keep_count(tmp_path):
         if seen == {"move", "swap"}:
             return
     raise AssertionError(f"only saw {seen} in 40 seeds")
+
+
+def test_trackb_masks_and_prefix_encoding():
+    import random
+    import torch
+    from jepatrain.model import Encoder, sincos_3d
+    from jepatrain.train import sample_masks
+    rng = random.Random(0)
+    for _ in range(50):
+        kind, ctx, tgt = sample_masks(rng, 8, 16, 0.5)
+        assert len(ctx) > 0 and len(tgt) > 0
+        assert set(ctx.tolist()).isdisjoint(tgt.tolist()) and len(ctx) + len(tgt) == 8 * 256
+        if kind == "prefix":
+            assert ctx.max() < tgt.min()
+    assert sincos_3d(8, 16, 16, 384).shape == (2048, 384)
+    enc = Encoder(dim=64, depth=1, heads=2)
+    x = torch.randn(1, 3, 32, 128, 128)
+    with torch.no_grad():
+        a = enc(x[:, :, :8])
+        b = enc(x, keep=torch.arange(512)[None])
+    assert torch.allclose(a, b, atol=1e-5)

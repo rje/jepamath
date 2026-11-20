@@ -28,8 +28,10 @@ def _stream(paths):
         yield s["__key__"], z["frames"], json.loads(s["episode.json"])
 
 
-def load_triples(data: str, split: str, n: int) -> list[dict]:
-    """First n seeds that have possible, impossible and control clips."""
+def load_triples(data: str, split: str, n: int, transform=None) -> list[dict]:
+    """First n seeds that have possible, impossible and control clips. `transform` (frames -> frames) is
+    applied as each clip is read, e.g. to downsample so thousands of triples fit in memory."""
+    transform = transform or (lambda f: f)
     idx = pq.read_table(os.path.join(data, f"index-{split}.parquet")).to_pandas()
     ctl = idx[idx.twin_kind == "control"].set_index("twin_of")
     imp = idx[idx.twin_kind == "impossible"].set_index("twin_of")
@@ -40,7 +42,7 @@ def load_triples(data: str, split: str, n: int) -> list[dict]:
         base = ep["twin_of"]
         if base not in ctl.index:
             continue
-        want[base] = {"seed_id": base, "impossible": frames, "meta": pos.loc[base].to_dict(),
+        want[base] = {"seed_id": base, "impossible": transform(frames), "meta": pos.loc[base].to_dict(),
                       "imp_meta": imp.loc[base].to_dict(), "ctl_meta": ctl.loc[base].to_dict()}
         if len(want) == n:
             break
@@ -51,7 +53,7 @@ def load_triples(data: str, split: str, n: int) -> list[dict]:
         for key, frames, ep in _stream(shard(kind)):
             base = key if kind == "possible" else ep["twin_of"]
             if base in want:
-                want[base][kind] = frames
+                want[base][kind] = transform(frames)
                 if kind == "possible":
                     want[base]["pos_episode"] = ep
                 found += 1
@@ -121,11 +123,14 @@ def _pct(a, b):
 
 
 def evaluate_reveal(data: str, split: str, sj: VJepaSurprise, n: int, fps: float = 4.0, log=print) -> dict:
+    return reveal_on_triples(load_triples(data, split, n), sj, fps, log)
+
+
+def reveal_on_triples(triples: list[dict], sj, fps: float = 4.0, log=print) -> dict:
     """Reveal-locked surprise: one window spanning the whole clip (subsampled to the model's max window),
     context = every frame before the screen starts lowering (so the starting count, the visible transfers
     and the hidden-interval are all in context), score = mean surprise on the time slots after the screen
     is fully down (the count is visible). The twins share this timeline, so the possible clip's is used."""
-    triples = load_triples(data, split, n)
     S = {k: [] for k in ("possible", "impossible", "control")}
     post, ctxs = [], []
     for i, t in enumerate(triples):
@@ -135,11 +140,12 @@ def evaluate_reveal(data: str, split: str, sj: VJepaSurprise, n: int, fps: float
             raise ValueError(f"clip of {T} frames does not subsample evenly to {sj.max_window}")
         f = fps / step
         t0, t1 = _screen_times(t["pos_episode"])
-        ctx = int(t0 * f) // 2 * 2
-        if ctx < 2:
+        tb = sj.tubelet
+        ctx = int(t0 * f) // tb * tb
+        if ctx < tb:
             raise ValueError(f"{t['seed_id']}: screen lowers at {t0:.2f}s, no context")
-        n_slots = (T // step - ctx) // 2
-        first = next((j for j in range(n_slots) if ctx + 2 * j + 1 >= math.ceil(t1 * f)), None)
+        n_slots = (T // step - ctx) // tb
+        first = next((j for j in range(n_slots) if ctx + tb * (j + 1) - 1 >= math.ceil(t1 * f)), None)
         if first is None:
             raise ValueError(f"{t['seed_id']}: no time slot after the reveal ends at {t1:.2f}s")
         for k in S:

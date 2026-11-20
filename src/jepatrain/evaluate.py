@@ -22,7 +22,7 @@ class TrainedSurprise(_SurpriseBase):
         self.enc, self.tgt, self.pred = enc, tgt, pred
         self.res, self.grid, self.tubelet = enc.img, enc.grid, enc.tubelet
 
-    def _batch(self, x, c):
+    def _pred_tgt(self, x, c):
         B, T = x.shape[0], x.shape[2]
         G = self.grid * self.grid
         n_ctx, N = c // self.tubelet * G, T // self.tubelet * G
@@ -31,7 +31,7 @@ class TrainedSurprise(_SurpriseBase):
         z = self.enc(x[:, :, :c])
         ar = lambda a, b: torch.arange(a, b, device=x.device).unsqueeze(0).expand(B, -1)
         p = self.pred(z, ar(0, n_ctx), ar(n_ctx, N))
-        return (p.float() - tgt).abs().mean(2)
+        return p.float(), tgt
 
     @torch.no_grad()
     def reveal_features(self, frames: np.ndarray, ep: dict) -> dict:

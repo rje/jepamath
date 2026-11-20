@@ -130,8 +130,11 @@ def reveal_on_triples(triples: list[dict], sj, fps: float = 4.0, log=print) -> d
     """Reveal-locked surprise: one window spanning the whole clip (subsampled to the model's max window),
     context = every frame before the screen starts lowering (so the starting count, the visible transfers
     and the hidden-interval are all in context), score = mean surprise on the time slots after the screen
-    is fully down (the count is visible). The twins share this timeline, so the possible clip's is used."""
+    is fully down (the count is visible). The twins share this timeline, so the possible clip's is used.
+    post_reveal_pooled scores the same slots by L1 between token-averaged prediction and target: it ignores
+    where objects are, so an extra object and a missing one can both count as errors."""
     S = {k: [] for k in ("possible", "impossible", "control")}
+    PP = {k: [] for k in S}   # pooled-feature surprise per clip
     post, ctxs = [], []
     for i, t in enumerate(triples):
         T = t["possible"].shape[0]
@@ -149,12 +152,15 @@ def reveal_on_triples(triples: list[dict], sj, fps: float = 4.0, log=print) -> d
         if first is None:
             raise ValueError(f"{t['seed_id']}: no time slot after the reveal ends at {t1:.2f}s")
         for k in S:
-            S[k].append(sj.slot_losses(sj.preprocess(t[k][::step]), ctx))
+            loss, pp, pt = sj.slot_pooled(sj.preprocess(t[k][::step]), ctx)
+            S[k].append(loss)
+            PP[k].append((pp[first:].mean(0) - pt[first:].mean(0)).abs().mean())
         post.append(first); ctxs.append(ctx)
         if (i + 1) % 25 == 0:
             log(f"[reveal] {i + 1}/{len(triples)} triples, guard {sj.guard.summary()}")
     score = {k: torch.stack([v[j:].mean() for v, j in zip(S[k], post)]) for k in S}
     whole = {k: torch.stack([v.mean() for v in S[k]]) for k in S}
+    pooled = {k: torch.stack(PP[k]) for k in S}
     meta = [t["meta"] for t in triples]
     vk = np.array([t["imp_meta"]["violation"] for t in triples])
     ck = np.array([t["ctl_meta"]["violation"] for t in triples])
@@ -162,9 +168,10 @@ def reveal_on_triples(triples: list[dict], sj, fps: float = 4.0, log=print) -> d
     groups = [("imp=add", vk == "add"), ("imp=delete", vk == "delete"), ("ctl=move", ck == "move"),
               ("ctl=swap", ck == "swap"), ("final<=3", final <= 3), ("final>=6", final >= 6)]
     out = {"n": len(triples), "post_reveal": _breakdown(score["impossible"], score["possible"], score["control"], groups),
+           "post_reveal_pooled": _breakdown(pooled["impossible"], pooled["possible"], pooled["control"], groups),
            "whole_target": _breakdown(whole["impossible"], whole["possible"], whole["control"], groups),
            "ctx_frames_median": float(np.median(ctxs))}
-    raw = {"slots": S, "first_post_slot": post, "ctx": ctxs, "seed_ids": [t["seed_id"] for t in triples],
+    raw = {"slots": S, "pooled": pooled, "first_post_slot": post, "ctx": ctxs, "seed_ids": [t["seed_id"] for t in triples],
            "imp_violation": vk.tolist(), "ctl_violation": ck.tolist(), "final": final.tolist(),
            "n0": [m["n0"] for m in meta], "op": [m["op"] for m in meta]}
     return {"metrics": out, "raw": raw}

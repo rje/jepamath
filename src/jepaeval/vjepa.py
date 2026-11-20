@@ -77,7 +77,8 @@ def _check_precision(precision: str):
 
 
 class _SurpriseBase:
-    """Shared windowing/preprocessing. Subclasses set res, grid, max_window and implement _batch(x, c),
+    """Shared windowing/preprocessing. Subclasses set res, grid, max_window and implement _pred_tgt(x, c) ->
+    (prediction, layer-normed target), each [B, n_target_tokens, D]; _batch(x, c),
     where x is [B, 3, window, res, res] and the return is [B, n_target_tokens] per-token surprise (L1 averaged
     over features) for context length c frames; target tokens are ordered time slot major."""
     res: int
@@ -130,6 +131,27 @@ class _SurpriseBase:
             out.append(torch.cat(losses))
         return torch.stack(out)
 
+    def _batch(self, x, c):
+        p, t = self._pred_tgt(x, c)
+        return (p - t).abs().mean(2)
+
+    @torch.no_grad()
+    def slot_pooled(self, video: torch.Tensor, ctx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One pass giving slot_losses' per-slot surprise [n_slots] plus per-slot token-averaged prediction and
+        target features [n_slots, D]: position-free summaries for a surprise that ignores where objects landed."""
+        T = video.shape[1]
+        if self.max_window is not None and T != self.max_window:
+            raise ValueError(f"this model takes exactly {self.max_window}-frame clips, got {T}")
+        if T % self.tubelet or ctx % self.tubelet or not 0 < ctx < T:
+            raise ValueError(f"bad clip/context: T={T} ctx={ctx}")
+        with self.guard, torch.autocast("cuda", dtype=self.autocast or torch.float16,
+                                        enabled=self.autocast is not None):
+            p, t = self._pred_tgt(video.unsqueeze(0), ctx)
+        S = (T - ctx) // self.tubelet
+        f = lambda z: z.float()[0].view(S, self.grid * self.grid, -1).mean(1).cpu()
+        loss = (p.float() - t.float()).abs().mean(2)[0].view(S, -1).mean(1).cpu()
+        return loss, f(p), f(t)
+
     @torch.no_grad()
     def slot_losses(self, video: torch.Tensor, ctx: int) -> torch.Tensor:
         """One window = the whole preprocessed clip [3, T, res, res]; the context is its first `ctx` frames.
@@ -168,7 +190,7 @@ class VJepaSurprise(_SurpriseBase):
         self.res = cfg.crop_size
         self.grid = cfg.crop_size // cfg.patch_size
 
-    def _batch(self, x, c):
+    def _pred_tgt(self, x, c):
         x = x.permute(0, 2, 1, 3, 4)                                   # HF layout [B, T, 3, H, W]
         B, window = x.shape[0], x.shape[1]
         tpf = self.grid * self.grid
@@ -181,7 +203,7 @@ class VJepaSurprise(_SurpriseBase):
         cm = [torch.arange(n_ctx, device=self.device).unsqueeze(0).repeat(B, 1)]
         tm = [torch.arange(n_ctx, N, device=self.device).unsqueeze(0).repeat(B, 1)]
         pred = self.model.predictor(encoder_hidden_states=z, context_mask=cm, target_mask=tm).last_hidden_state
-        return (pred.float() - tgt).abs().mean(2)
+        return pred.float(), tgt
 
 
 VJEPA1_REPO = "/mnt/data/ext/jepa1"                       # github.com/facebookresearch/jepa
@@ -217,7 +239,7 @@ class VJepa1Surprise(_SurpriseBase):
             m.to(device).eval()
         self.res, self.grid = 224, 14
 
-    def _batch(self, x, c):
+    def _pred_tgt(self, x, c):
         B, window = x.shape[0], x.shape[2]
         tpf = self.grid * self.grid
         n_ctx, N = (c // TUBELET) * tpf, (window // TUBELET) * tpf
@@ -227,4 +249,4 @@ class VJepa1Surprise(_SurpriseBase):
         tm = torch.arange(n_ctx, N, device=self.device).unsqueeze(0).repeat(B, 1)
         z = self.ctx_enc(x, masks=[cm])
         pred = self.pred(z, None, [cm], [tm])
-        return (pred.float() - tgt).abs().mean(2)
+        return pred.float(), tgt

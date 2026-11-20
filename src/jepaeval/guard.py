@@ -3,11 +3,16 @@
 The GPU on this machine has been unstable, so compute never runs flat out:
   * duty cycle: after each guarded step, sleep so that GPU-busy time is at most `duty` of wall time;
   * thermal pause: above `temp_ceiling_c`, stop until the GPU cools by `temp_resume_drop_c`;
-  * power ceiling: if board power exceeds `power_ceiling_w` at a check, raise the sleep factor.
+  * power ceiling: if board power exceeds `power_ceiling_w` at a check, raise the sleep factor;
+  * one GPU process at a time: each guard takes an exclusive lock and raises if another process holds it.
+    Two guarded processes overlapping (training + a probe) preceded an Xid 109/62 GPU hang on 2026-11-20.
 """
+
 
 from __future__ import annotations
 
+import fcntl
+import os
 import subprocess
 import sys
 import time
@@ -16,11 +21,29 @@ import torch
 
 from jepagen.limiter import gpu_temperature_c
 
+LOCK_PATH = os.environ.get("JEPAMATH_GPU_LOCK", "/tmp/jepamath-gpu.lock")
+_held_lock = None   # one lock per process, shared by every guard in it
+
 
 def gpu_power_w() -> float:
     out = subprocess.run(["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
                          check=True, capture_output=True, text=True).stdout
     return max(float(x) for x in out.split())
+
+
+def _acquire_gpu_lock():
+    global _held_lock
+    if _held_lock is not None:
+        return
+    f = open(LOCK_PATH, "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.seek(0)
+        raise RuntimeError(f"another process holds the GPU lock {LOCK_PATH} ({f.read().strip()}); "
+                           "run GPU jobs one at a time") from None
+    f.seek(0); f.truncate(); f.write(f"pid {os.getpid()}: {' '.join(sys.argv)}\n"); f.flush()
+    _held_lock = f
 
 
 class ComputeGuard:
@@ -40,6 +63,7 @@ class ComputeGuard:
         self.max_temp = 0.0
         self.max_power = 0.0
         self.log = log or (lambda m: print(m, file=sys.stderr, flush=True))
+        _acquire_gpu_lock()
 
     def __enter__(self):
         self._check()

@@ -14,7 +14,7 @@ import pyarrow.parquet as pq
 from .limiter import RenderLimiter, gpu_status
 from .run import run_episode, run_episodes_batched
 from .sampler import Manifest, Template, can_control, make_twin, sample_episode
-from .shards import Shards, check_disk, clip_to_sample, index_row
+from .shards import Shards, check_disk, clip_to_sample, index_row, shard_dir
 from .validate import validate_clip, validate_twins
 
 
@@ -72,7 +72,9 @@ def _judge(job: Job, seed: int, eps: list, results: list) -> dict:
             return out
         items.append((tclip, {**tval.metrics, **pval.metrics}))
     for c, metrics in items:
-        out["accepted"].append((c, clip_to_sample(c, job.backend, metrics)))
+        # only the compressed sample and its index row go back to the parent, never raw frames
+        d = shard_dir(c)
+        out["accepted"].append((d, clip_to_sample(c, job.backend, metrics), index_row(c, job.backend, d)))
     return out
 
 
@@ -141,9 +143,9 @@ def generate(template: Template, manifest: Manifest, split: str, seeds: range, o
                 for r in res["rejected"]:
                     rej.write(json.dumps(r) + "\n")
                     n_rej += 1
-                for clip, sample in res["accepted"]:
-                    d = shards.write(clip, sample)
-                    rows.append(index_row(clip, backend, d))
+                for d, sample, row in res["accepted"]:
+                    shards.write(d, sample)
+                    rows.append(row)
             now = time.monotonic()
             if now - last_log > 30 or done == len(seeds):
                 last_log = now

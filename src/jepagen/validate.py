@@ -13,8 +13,13 @@ MAX_PENETRATION_M = 0.003
 MAX_FRAME_JUMP_M = 0.6          # faster than any claw move between frames => teleport
 REST_LIN_SPEED = 0.02           # m/s, final frame
 REST_ANG_SPEED = 1.0            # rad/s, final frame
-MIN_VISIBLE_PX = 6              # every non-reserve object visible at first and last frame
-MIN_TWIN_DIFF_PX = MIN_VISIBLE_PX  # a twin's hidden change must show at the end: at least one object's worth
+MIN_VISIBLE_PX_128 = 6          # every non-reserve object visible at first and last frame (px at 128x128)
+
+
+def min_visible_px(width: int, height: int) -> int:
+    """MIN_VISIBLE_PX_128 scaled by frame area, so the check means the same at any resolution.
+    A twin's hidden change must also differ by at least this many seg pixels at the end."""
+    return max(1, round(MIN_VISIBLE_PX_128 * width * height / (128 * 128)))
 
 
 @dataclass
@@ -85,6 +90,7 @@ def validate_clip(clip: ClipResult, diag: dict) -> Validation:
 
     # visibility
     px = _px_per_object(clip.seg, n_obj)
+    MIN_VISIBLE_PX = min_visible_px(ep.clip.width, ep.clip.height)
     for idx, name in ((0, "first"), (-1, "last")):
         for o in st[idx].objects:
             if o["region"] in ("box", "hopper") and px[idx, o["id"]] < MIN_VISIBLE_PX:
@@ -141,6 +147,6 @@ def validate_twins(possible: ClipResult, impossible: ClipResult) -> Validation:
             reasons.append(f"twins differ before violation at frame {i} (t={t:.2f})")
             break
     diff = int((possible.seg[-1] != impossible.seg[-1]).sum())
-    if diff < MIN_TWIN_DIFF_PX:
+    if diff < min_visible_px(possible.episode.clip.width, possible.episode.clip.height):
         reasons.append(f"hidden {v.kind} barely visible at the end ({diff} px differ)")
     return Validation(ok=not reasons, reasons=reasons, metrics={"final_seg_diff_px": diff})

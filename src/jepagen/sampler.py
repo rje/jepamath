@@ -70,7 +70,7 @@ class Template(_Strict):
     use_screen: bool = True
     transfer_s: tuple[float, float] = (1.6, 2.0)
     screen_move_s: tuple[float, float] = (0.3, 0.5)
-    clip: Clip = Clip(n_frames=32, fps=4, width=128, height=128)
+    clip: Clip = Clip(n_frames=32, fps=4, width=256, height=256)
     physics: Physics = Physics()
     scene: SceneRanges = SceneRanges()
 

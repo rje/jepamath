@@ -25,6 +25,10 @@ def clip_to_sample(clip: ClipResult, backend: str, validation_metrics: dict) -> 
             "state.json": json.dumps(state).encode(), "episode.json": clip.episode.to_json().encode()}
 
 
+def shard_dir(clip: ClipResult) -> str:
+    return os.path.join(clip.episode.split, clip.episode.twin_kind)
+
+
 def index_row(clip: ClipResult, backend: str, shard_dir: str) -> dict:
     ep, m = clip.episode, clip.episode.meta
     return {"episode_id": ep.episode_id, "seed": ep.seed, "split": ep.split, "backend": backend,
@@ -57,11 +61,8 @@ class Shards:
         self.max_bytes = max_bytes
         self.writers: dict[str, wds.ShardWriter] = {}
 
-    def dir_for(self, clip: ClipResult) -> str:
-        return os.path.join(clip.episode.split, clip.episode.twin_kind)
-
-    def write(self, clip: ClipResult, sample: dict) -> str:
-        d = self.dir_for(clip)
+    def write(self, d: str, sample: dict) -> None:
+        """d: shard subdirectory from shard_dir(); passed in so workers never ship raw clips here."""
         if d not in self.writers:
             full = os.path.join(self.out_dir, d)
             os.makedirs(full, exist_ok=True)
@@ -69,7 +70,6 @@ class Shards:
             self.writers[d] = wds.ShardWriter(os.path.join(full, "shard-%06d.tar"), maxsize=self.max_bytes,
                                               maxcount=100_000, start_shard=existing, verbose=0)
         self.writers[d].write(sample)
-        return d
 
     def close(self):
         for w in self.writers.values():

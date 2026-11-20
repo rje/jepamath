@@ -4,7 +4,10 @@ Masks (shared across a batch, resampled every step):
   prefix  (p_prefix)  : context = the first c time slots, target = the rest (the reveal-locked test's shape)
   short tube          : 8 spatial blocks of ~15% area, masked over all slots (V-JEPA short-range)
   long tube           : 2 spatial blocks of ~70% area, masked over all slots (V-JEPA long-range)
-Loss: L1 between predictor output and the layer-normed EMA target encoder, on target tokens.
+Loss: L1 (V-JEPA) or L2 between predictor output and the layer-normed EMA target encoder, on target tokens,
+plus optionally `pool_weight` x the same distance between per-slot token averages of prediction and target.
+Why L2/pooled: the L1 optimum is the per-token median, which under uncertain object positions is "no object",
+so an L1 model is least surprised by missing objects (the add/delete asymmetry seen in Track A and run 1).
 """
 
 from __future__ import annotations
@@ -56,6 +59,15 @@ def sample_masks(rng: random.Random, slots: int, grid: int, p_prefix: float):
     return kind, idx[~tgt], idx[tgt]
 
 
+def per_slot(tgt_idx: torch.Tensor, tokens_per_slot: int = 256) -> int:
+    """Number of target tokens in each slot; raises unless every slot that has targets has the same number."""
+    counts = torch.bincount(tgt_idx // tokens_per_slot)
+    counts = counts[counts > 0]
+    if not (counts == counts[0]).all():
+        raise ValueError(f"uneven target tokens per slot: {counts.tolist()}")
+    return int(counts[0])
+
+
 def main():
     ap = argparse.ArgumentParser(prog="jepatrain")
     ap.add_argument("--data", default="/mnt/data/jepamath/v2")
@@ -68,6 +80,9 @@ def main():
     ap.add_argument("--warmup", type=int, default=1500)
     ap.add_argument("--ema", type=float, nargs=2, default=(0.996, 1.0))
     ap.add_argument("--p-prefix", type=float, default=0.5)
+    ap.add_argument("--loss", choices=("l1", "l2"), default="l1")
+    ap.add_argument("--pool-weight", type=float, default=0.0,
+                    help="weight of the per-slot pooled (position-free) prediction loss")
     ap.add_argument("--dim", type=int, default=384)
     ap.add_argument("--depth", type=int, default=8)
     ap.add_argument("--pred-dim", type=int, default=256)
@@ -161,7 +176,16 @@ def main():
                     ht = torch.gather(h, 1, tg[..., None].expand(-1, -1, h.shape[-1]))
                 z = enc(x, keep=ctx)
                 p = pred(z, ctx, tg).float()
-                loss = (p - ht).abs().mean()
+                dist = (lambda d: d.abs()) if a.loss == "l1" else (lambda d: d.pow(2))
+                tok_loss = dist(p - ht).mean()
+                loss = tok_loss
+                if a.pool_weight:
+                    # target tokens are slot-major with the same count per slot (prefix: whole slots;
+                    # tubes: the same spatial cells in every slot), so a reshape groups them by slot
+                    S_t = tg.shape[1] // per_slot(tg[0], enc.tokens_per_slot)
+                    pp, hp = (v.view(B, S_t, -1, v.shape[-1]).mean(2) for v in (p, ht))
+                    pool_loss = dist(pp - hp).mean()
+                    loss = tok_loss + a.pool_weight * pool_loss
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite loss at step {step}")
             opt.zero_grad(set_to_none=True)
@@ -173,7 +197,8 @@ def main():
                 torch._foreach_mul_(list(tgt.parameters()), m)
                 torch._foreach_add_(list(tgt.parameters()), list(enc.parameters()), alpha=1 - m)
         step += 1
-        for k, v in ((f"loss_{kind}", float(loss)), ("gnorm", float(gn)),
+        extra = ((f"pool_{kind}", float(pool_loss)),) if a.pool_weight else ()
+        for k, v in ((f"loss_{kind}", float(tok_loss)), *extra, ("gnorm", float(gn)),
                      ("tgt_std", float(h.std(0).mean())), ("pred_std", float(p.std(0).mean()))):
             acc.setdefault(k, []).append(v)
         if step % a.log_every == 0:

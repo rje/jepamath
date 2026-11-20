@@ -508,20 +508,23 @@ def make_twin(ep: Episode, seed: int, kind: Literal["impossible", "control"] = "
     elif kind == "control":
         if not can_control(ep):
             raise ValueError("control twin needs a non-empty box at the end")
-        vk = str(rng.choice(["move", "swap"]))
+        # A swap restyles the reserve with a colour far from every visible object's. The reserve is
+        # never visible before the violation, so the twins stay pixel-identical up to t_v. A crowded
+        # random palette can leave no such colour; then a swap is not a valid control for this scene
+        # and only move is offered (recorded in meta["swap_feasible"]).
+        visible = [o.color for o in ep.objects if o.start_region != "reserve"]
+        floors = [ep.scene.box.color, ep.scene.hopper.color]
+        c = None
+        for _ in range(500):
+            cand = _hsv(rng, (0.45, 0.9), (0.6, 0.95))
+            if all(_cdist(cand, f) >= 0.25 for f in floors) and all(_cdist(cand, o) >= 0.35 for o in visible):
+                c = cand
+                break
+        meta["swap_feasible"] = c is not None
+        vk = str(rng.choice(["move", "swap"])) if c is not None else "move"
         if vk == "move":
             v = Violation(kind="move", t=t_v, object_id=None, pos=None)
         else:
-            # The reserve is never visible before the violation, so restyling it keeps the twins
-            # pixel-identical up to t_v. New look: a colour far from every visible object's.
-            visible = [o.color for o in ep.objects if o.start_region != "reserve"]
-            floors = [ep.scene.box.color, ep.scene.hopper.color]
-            for _ in range(500):
-                c = _hsv(rng, (0.45, 0.9), (0.6, 0.95))
-                if all(_cdist(c, f) >= 0.25 for f in floors) and all(_cdist(c, o) >= 0.35 for o in visible):
-                    break
-            else:
-                raise RuntimeError("no swap colour distinct from the scene's objects")
             shape = str(rng.choice(["sphere", "box", "cylinder"]))
             r = float(ep.meta["base_radius"])
             size = _size_for(shape, r)

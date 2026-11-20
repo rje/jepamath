@@ -563,7 +563,18 @@ impl Renderer {
         }
         let s = &sc.screen;
         let sz = rules::screen_top_z(ep, w.t) - s.height / 2.0;
-        out.push(cube([s.center_x, s.y, sz], [s.width / 2.0, s.thickness / 2.0, s.height / 2.0], s.color, SEG_SCREEN));
+        out.push((
+            MeshKind::Cube,
+            instance(
+                Mat4::from_scale_rotation_translation(
+                    v3([s.width / 2.0, s.thickness / 2.0, s.height / 2.0]),
+                    Quat::from_rotation_z(s.yaw as f32),
+                    v3([s.center_x, s.y, sz]),
+                ),
+                s.color,
+                SEG_SCREEN,
+            ),
+        ));
         let cp = w.claw_pos();
         let ph = rules::CLAW_PAD_HALF;
         let dark = [0.15, 0.15, 0.17, 1.0];

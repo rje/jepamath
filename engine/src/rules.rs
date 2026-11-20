@@ -208,6 +208,24 @@ pub fn violation_add_pos(ep: &Episode, oid: usize, hint: V3, poses: &[PoseQ]) ->
     Ok([d[0], d[1], d[2] + z_extent(o.shape, &o.size, [1.0, 0.0, 0.0, 0.0]) + VIOLATION_ADD_GAP])
 }
 
+/// Where a hidden 'move' relocates the topmost box object `oid`: the drop rule aimed at the box
+/// quadrant centre farthest from the object's current position (ties -> lowest quadrant index).
+pub fn violation_move_pos(ep: &Episode, oid: usize, poses: &[PoseQ]) -> Result<V3, String> {
+    let b = &ep.scene.box_;
+    let (qx, qy) = (b.inner_size[0] / 4.0, b.inner_size[1] / 4.0);
+    let p = poses[oid].0;
+    let mut best: Option<(f64, V2)> = None;
+    for (sx, sy) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+        let c = [b.center[0] + sx * qx, b.center[1] + sy * qy];
+        let d = (c[0] - p[0]).hypot(c[1] - p[1]);
+        if best.map(|(bd, _)| d > bd + 1e-12).unwrap_or(true) {
+            best = Some((d, c));
+        }
+    }
+    let hint = best.unwrap().1;
+    violation_add_pos(ep, oid, [hint[0], hint[1], 0.0], poses)
+}
+
 pub struct ClawController {
     home: V3,
     travel_z: f64,

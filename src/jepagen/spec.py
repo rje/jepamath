@@ -12,7 +12,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION = "0.1"
+SPEC_VERSION = "0.2"
 
 Vec2 = tuple[float, float]
 Vec3 = tuple[float, float, float]
@@ -41,11 +41,13 @@ class Tray(_Strict):
 class Screen(_Strict):
     """Vertical occluder in front of the box. Rises out of a slot in the table.
 
-    `raised` means it hides the box interior from the camera.
+    `raised` means it hides the box interior from the camera. The panel's plane is vertical;
+    `yaw` rotates it about z (0 = panel in the x-z plane, facing -y).
     """
 
     center_x: float
     y: float
+    yaw: float = 0.0
     width: float
     height: float
     thickness: float
@@ -120,14 +122,25 @@ class Transfer(_Strict):
 Action = ScreenMove | Transfer
 
 
-class Violation(_Strict):
-    """Hidden change applied to an impossible twin while the box is occluded."""
+ViolationKind = Literal["add", "delete", "move", "swap"]
+COUNT_CHANGING = ("add", "delete")   # impossible twins
+COUNT_PRESERVING = ("move", "swap")  # control twins: an unexplained hidden change, same count
 
-    kind: Literal["add", "delete"]
+
+class Violation(_Strict):
+    """Hidden change applied to a twin while the box is occluded.
+
+    add:    reserve object `object_id` placed into the box; `pos` is a hint -- backends place it
+            with the shared drop rule (lowest free spot nearest pos[:2]), never inside the pile.
+    delete: the topmost box object (same rule as Transfer) goes to the reserve.
+    move:   the topmost box object is relocated by the drop rule to the box quadrant centre
+            farthest from where it was. object_id/pos None.
+    swap:   the topmost box object goes to the reserve and reserve object `object_id` (a
+            different shape/colour) takes its place via the drop rule. pos None.
+    """
+
+    kind: ViolationKind
     t: float
-    # add: a reserve object placed into the box; `pos` is a hint -- backends place it with the
-    # shared drop rule (lowest free spot nearest pos[:2]) so it never lands inside the pile;
-    # delete: None -> resolved at run time as the topmost object in the box (same rule as Transfer).
     object_id: int | None
     pos: Vec3 | None
 
@@ -187,13 +200,24 @@ class Episode(_Strict):
                 raise ValueError(f"violation at t={v.t} while the box is visible")
             if any(isinstance(a, Transfer) and a.t_start <= v.t <= a.t_end for a in acts):
                 raise ValueError("violation during a transfer")
-            if v.kind == "add":
-                if v.object_id is None or v.pos is None:
-                    raise ValueError("add violation needs object_id and pos")
+            if v.kind == "add" and (v.object_id is None or v.pos is None):
+                raise ValueError("add violation needs object_id and pos")
+            if v.kind == "swap" and (v.object_id is None or v.pos is not None):
+                raise ValueError("swap violation needs object_id and no pos")
+            if v.kind in ("delete", "move") and (v.object_id is not None or v.pos is not None):
+                raise ValueError(f"{v.kind} violation takes no object_id/pos")
+            if v.object_id is not None:
                 o = next((o for o in self.objects if o.id == v.object_id), None)
                 if o is None or o.start_region != "reserve":
-                    raise ValueError("add violation must use a reserve object")
+                    raise ValueError(f"{v.kind} violation must use a reserve object")
         return self
+
+    @property
+    def twin_kind(self) -> str:
+        """possible | impossible (count changes) | control (count-preserving hidden change)."""
+        if self.violation is None:
+            return "possible"
+        return "impossible" if self.violation.kind in COUNT_CHANGING else "control"
 
     def screen_intervals(self) -> list[tuple[float, float]]:
         """Intervals where the screen is fully raised."""

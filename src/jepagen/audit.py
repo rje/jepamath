@@ -13,7 +13,7 @@ import os
 
 import numpy as np
 import webdataset as wds
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, QhullError
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score
@@ -33,7 +33,7 @@ def _features(frames, seg, state) -> list[float]:
     if len(xs) >= 3:
         try:
             hull = ConvexHull(np.stack([xs, ys], 1)).volume
-        except Exception:  # degenerate (collinear) point sets have zero area
+        except QhullError:  # degenerate (collinear) point sets have zero area
             hull = 0.0
     reveal = state["metrics"]["reveal_t"]
     return [float(obj.sum()), float(f.mean()), float(hull), float(reveal if reveal is not None else -1)]

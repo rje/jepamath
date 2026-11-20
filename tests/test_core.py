@@ -89,3 +89,29 @@ def test_batched_render_matches_unbatched(tmp_path):
         assert np.array_equal(clip.seg, bclip.seg), ep.episode_id
         assert diag["max_penetration"] == bdiag["max_penetration"]
         assert clip.states == bclip.states
+
+
+def test_control_twins_keep_count(tmp_path):
+    """move/swap twins: identical before the change, same final count, a visible difference at the end."""
+    from jepagen.sampler import can_control
+
+    lim = RenderLimiter(str(tmp_path / "lim"), max_fps=1000)
+    t, m = Template(), Manifest()
+    seen = set()
+    for seed in range(40):
+        ep = sample_episode(t, m, "train", seed)
+        if not can_control(ep):
+            continue
+        tw = make_twin(ep, seed, "control")
+        if tw.violation.kind in seen:
+            continue
+        seen.add(tw.violation.kind)
+        assert tw.twin_kind == "control" and tw.meta["shown_final"] == ep.meta["final"]
+        a, da = run_episode(ep, "rust", lim)
+        b, db = run_episode(tw, "rust", lim)
+        va, vb, vt = validate_clip(a, da), validate_clip(b, db), validate_twins(a, b)
+        assert va.ok and vb.ok and vt.ok, (seed, tw.violation.kind, va.reasons, vb.reasons, vt.reasons)
+        assert b.states[-1].count_per_region["box"] == a.states[-1].count_per_region["box"]
+        if seen == {"move", "swap"}:
+            return
+    raise AssertionError(f"only saw {seen} in 40 seeds")

@@ -276,6 +276,25 @@ impl World {
                 self.phys.place(oid, [oid as f64 * 0.3, 0.0, rules::RESERVE_Z + 0.1]);
                 oid
             }
+            "move" => {
+                let poses = self.phys.poses();
+                let oid = rules::pick_topmost(&self.ep, Region::Box, &poses, &self.phys.held())?;
+                let p = rules::violation_move_pos(&self.ep, oid, &poses)?;
+                self.phys.place(oid, p);
+                oid
+            }
+            "swap" => {
+                // the topmost box object leaves for the reserve; the reserve object takes its spot
+                let in_id = v.object_id.ok_or("swap violation without object_id")?;
+                let poses = self.phys.poses();
+                let out_id = rules::pick_topmost(&self.ep, Region::Box, &poses, &self.phys.held())?;
+                let old = poses[out_id].0;
+                self.phys.place(out_id, [out_id as f64 * 0.3, 0.0, rules::RESERVE_Z + 0.1]);
+                let p = rules::violation_add_pos(&self.ep, in_id, [old[0], old[1], 0.0], &self.phys.poses())?;
+                self.phys.place(in_id, p);
+                self.events.push(Event { t: self.t, event: "violation_swap_in".into(), object_id: in_id });
+                out_id
+            }
             k => return Err(format!("unknown violation kind {k}")),
         };
         self.events.push(Event { t: self.t, event: format!("violation_{}", v.kind), object_id: oid });

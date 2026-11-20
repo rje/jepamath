@@ -14,6 +14,7 @@ MAX_FRAME_JUMP_M = 0.6          # faster than any claw move between frames => te
 REST_LIN_SPEED = 0.02           # m/s, final frame
 REST_ANG_SPEED = 1.0            # rad/s, final frame
 MIN_VISIBLE_PX = 6              # every non-reserve object visible at first and last frame
+MIN_TWIN_DIFF_PX = MIN_VISIBLE_PX  # a twin's hidden change must show at the end: at least one object's worth
 
 
 @dataclass
@@ -57,7 +58,7 @@ def validate_clip(clip: ClipResult, diag: dict) -> Validation:
         if s.count_per_region["table"]:
             reasons.append(f"object escaped to table at t={s.t:.2f}")
             break
-    exp_reserve_end = len(reserve_ids) + (0 if v is None else (-1 if v.kind == "add" else 1))
+    exp_reserve_end = len(reserve_ids) + {None: 0, "add": -1, "delete": 1, "move": 0, "swap": 0}[v.kind if v else None]
     if last["reserve"] != exp_reserve_end:
         reasons.append(f"reserve count {last['reserve']} != {exp_reserve_end}")
     if last["claw"]:
@@ -74,10 +75,10 @@ def validate_clip(clip: ClipResult, diag: dict) -> Validation:
             break
 
     # teleport check (the violation's own jump excepted)
-    viol_obj = next((e["object_id"] for e in clip.events if e["event"].startswith("violation")), None)
+    viol_objs = {e["object_id"] for e in clip.events if e["event"].startswith("violation")}
     for a, b in zip(st, st[1:]):
         for oa, ob in zip(a.objects, b.objects):
-            if oa["id"] == viol_obj:
+            if oa["id"] in viol_objs:
                 continue
             if np.linalg.norm(np.subtract(ob["pos"], oa["pos"])) > MAX_FRAME_JUMP_M:
                 reasons.append(f"object {oa['id']} jumped between t={a.t:.2f} and {b.t:.2f}")
@@ -93,6 +94,22 @@ def validate_clip(clip: ClipResult, diag: dict) -> Validation:
             if s.objects[oid]["region"] == "reserve" and px[ti, oid] > 0:
                 reasons.append(f"reserve object {oid} visible at t={s.t:.2f}")
                 break
+    # every carried object must show while held: the claw's work is the visible cause
+    held_px: dict[int, int] = {}
+    for ti, s in enumerate(st):
+        for o in s.objects:
+            if o["region"] == "claw":
+                held_px[o["id"]] = max(held_px.get(o["id"], 0), int(px[ti, o["id"]]))
+    grasped = [e["object_id"] for e in clip.events if e["event"] == "grasp"]
+    for oid in grasped:
+        if held_px.get(oid, 0) < MIN_VISIBLE_PX:
+            reasons.append(f"carried object {oid} never visible while held ({held_px.get(oid, 0)} px)")
+    # the screen must not hide the hopper: check the first frame with the screen fully raised
+    first_up = next((ti for ti, s in enumerate(st) if ep.box_occluded_at(s.t)), None)
+    if first_up is not None:
+        for o in st[first_up].objects:
+            if o["region"] == "hopper" and px[first_up, o["id"]] < MIN_VISIBLE_PX and px[0, o["id"]] >= MIN_VISIBLE_PX:
+                reasons.append(f"hopper object {o['id']} hidden by the raised screen")
     # occlusion: while the screen is fully raised, nothing resting in the box may show
     for ti, s in enumerate(st):
         if ep.box_occluded_at(s.t):
@@ -123,4 +140,7 @@ def validate_twins(possible: ClipResult, impossible: ClipResult) -> Validation:
         if not np.array_equal(possible.frames[i], impossible.frames[i]):
             reasons.append(f"twins differ before violation at frame {i} (t={t:.2f})")
             break
-    return Validation(ok=not reasons, reasons=reasons)
+    diff = int((possible.seg[-1] != impossible.seg[-1]).sum())
+    if diff < MIN_TWIN_DIFF_PX:
+        reasons.append(f"hidden {v.kind} barely visible at the end ({diff} px differ)")
+    return Validation(ok=not reasons, reasons=reasons, metrics={"final_seg_diff_px": diff})

@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 
 from .limiter import RenderLimiter, gpu_status
 from .run import run_episode, run_episodes_batched
-from .sampler import Manifest, Template, make_twin, sample_episode
+from .sampler import Manifest, Template, can_control, make_twin, sample_episode
 from .shards import Shards, check_disk, clip_to_sample, index_row
 from .validate import validate_clip, validate_twins
 
@@ -24,7 +24,7 @@ class Job:
     manifest: dict
     split: str
     backend: str
-    twins: bool
+    twins: tuple[str, ...]  # twin kinds per seed: "impossible" (count changes), "control" (move/swap)
     limiter_path: str
     max_render_fps: float
     temp_ceiling_c: float
@@ -41,98 +41,90 @@ def _limiter(job: Job) -> RenderLimiter:
     return _LIMITER
 
 
-def produce(job: Job, seed: int) -> dict:
-    """Runs one seed. Returns accepted samples, or the rejection reasons. Never raises for a bad
-    clip (that is a rejection, recorded); raises for anything else."""
-    t, m = Template.model_validate(job.template), Manifest.model_validate(job.manifest)
-    lim = _limiter(job)
+def _episodes_for(job: Job, t: Template, m: Manifest, seed: int) -> list:
+    """The possible episode followed by its twins. Control twins are skipped when the box ends empty
+    (nothing to move or swap); that is the only case a requested twin is not made."""
     ep = sample_episode(t, m, job.split, seed)
-    clip, diag = run_episode(ep, job.backend, lim)
-    val = validate_clip(clip, diag)
-    out = {"seed": seed, "episode_id": ep.episode_id, "accepted": [], "rejected": []}
-    if not val.ok:
-        out["rejected"].append({"episode_id": ep.episode_id, "reasons": val.reasons})
-        return out
-    items = [(clip, val)]
-    if job.twins:
-        tw = make_twin(ep, seed)
-        tclip, tdiag = run_episode(tw, job.backend, lim)
-        tval = validate_clip(tclip, tdiag)
-        pval = validate_twins(clip, tclip)
-        if not (tval.ok and pval.ok):
-            # the pair is the unit: drop both so every impossible clip has its possible twin
-            out["rejected"].append({"episode_id": tw.episode_id, "reasons": tval.reasons + pval.reasons})
-            return out
-        items.append((tclip, tval))
-    for c, v in items:
-        out["accepted"].append((c, clip_to_sample(c, job.backend, v.metrics)))
+    out = [ep]
+    for kind in job.twins:
+        if kind == "control" and not can_control(ep):
+            continue
+        out.append(make_twin(ep, seed, kind))
     return out
 
 
-def _judge(job: Job, seed: int, ep, clip, diag, tw=None, tclip=None, tdiag=None) -> dict:
-    val = validate_clip(clip, diag)
+def _judge(job: Job, seed: int, eps: list, results: list) -> dict:
+    """The seed's clips are one unit: if the possible clip or any twin fails, none are kept, so every
+    twin in the dataset has its possible clip."""
+    ep = eps[0]
     out = {"seed": seed, "episode_id": ep.episode_id, "accepted": [], "rejected": []}
+    clip, diag = results[0]
+    val = validate_clip(clip, diag)
     if not val.ok:
         out["rejected"].append({"episode_id": ep.episode_id, "reasons": val.reasons})
         return out
-    items = [(clip, val)]
-    if tw is not None:
+    items = [(clip, val.metrics)]
+    for tw, (tclip, tdiag) in zip(eps[1:], results[1:]):
         tval = validate_clip(tclip, tdiag)
         pval = validate_twins(clip, tclip)
         if not (tval.ok and pval.ok):
             out["rejected"].append({"episode_id": tw.episode_id, "reasons": tval.reasons + pval.reasons})
             return out
-        items.append((tclip, tval))
-    for c, v in items:
-        out["accepted"].append((c, clip_to_sample(c, job.backend, v.metrics)))
+        items.append((tclip, {**tval.metrics, **pval.metrics}))
+    for c, metrics in items:
+        out["accepted"].append((c, clip_to_sample(c, job.backend, metrics)))
     return out
 
 
-def produce_batch(job: Job, seeds: list[int]) -> list[dict]:
-    """Runs several seeds (and their twins) as one batched render: every frame of every clip in
-    the group is one GPU submission. Same outputs as calling `produce` per seed."""
+def produce_group(job: Job, seeds: list[int]) -> list[dict]:
+    """Runs several seeds and their twins. With job.batch > 1 every frame of every clip in the group
+    is one GPU submission; the clips are identical either way."""
     t, m = Template.model_validate(job.template), Manifest.model_validate(job.manifest)
     lim = _limiter(job)
-    eps = [sample_episode(t, m, job.split, s) for s in seeds]
-    tws = [make_twin(ep, s) for ep, s in zip(eps, seeds)] if job.twins else []
-    res = run_episodes_batched(eps + tws, lim)
-    outs = []
-    for j, (s, ep) in enumerate(zip(seeds, eps)):
-        clip, diag = res[j]
-        if job.twins:
-            tclip, tdiag = res[len(eps) + j]
-            outs.append(_judge(job, s, ep, clip, diag, tws[j], tclip, tdiag))
-        else:
-            outs.append(_judge(job, s, ep, clip, diag))
+    groups = [_episodes_for(job, t, m, s) for s in seeds]
+    flat = [e for g in groups for e in g]
+    if job.batch > 1:
+        res = run_episodes_batched(flat, lim)
+    else:
+        res = [run_episode(e, job.backend, lim) for e in flat]
+    outs, i = [], 0
+    for s, g in zip(seeds, groups):
+        outs.append(_judge(job, s, g, res[i:i + len(g)]))
+        i += len(g)
     return outs
+
+
+def produce(job: Job, seed: int) -> dict:
+    return produce_group(job, [seed])[0]
 
 
 def _work(args):
     job, seeds = args
-    if job.batch > 1:
-        return produce_batch(job, seeds)
-    return [produce(job, s) for s in seeds]
+    return produce_group(job, seeds)
 
 
 def generate(template: Template, manifest: Manifest, split: str, seeds: range, out_dir: str, backend: str = "mujoco",
-             twins: bool = False, workers: int = 4, max_render_fps: float = 60.0, temp_ceiling_c: float = 83.0,
+             twins: tuple[str, ...] = (), workers: int = 4, max_render_fps: float = 60.0, temp_ceiling_c: float = 83.0,
              batch: int = 1, est_bytes_per_clip: int = 400_000) -> dict:
     if batch < 1:
         raise ValueError("batch must be >= 1")
     if batch > 1 and backend != "rust":
         raise ValueError("batched rendering needs the rust backend")
-    scenes_per_seed = 2 if twins else 1
-    if batch % scenes_per_seed:
-        raise ValueError(f"batch {batch} must be a multiple of {scenes_per_seed} (each seed renders {scenes_per_seed} clips)")
+    for k in twins:
+        if k not in ("impossible", "control"):
+            raise ValueError(f"unknown twin kind {k!r}")
+    scenes_per_seed = 1 + len(twins)   # at most; control twins are skipped for empty boxes
+    if batch > 1 and batch < scenes_per_seed:
+        raise ValueError(f"batch {batch} is smaller than the {scenes_per_seed} clips one seed renders")
     seeds_per_task = max(1, batch // scenes_per_seed)
     os.makedirs(out_dir, exist_ok=True)
-    n_clips = len(seeds) * (2 if twins else 1)
+    n_clips = len(seeds) * (1 + len(twins))
     check_disk(out_dir, n_clips * est_bytes_per_clip)
-    job = Job(template.model_dump(mode="json"), manifest.model_dump(mode="json"), split, backend, twins,
+    job = Job(template.model_dump(mode="json"), manifest.model_dump(mode="json"), split, backend, tuple(twins),
               os.path.join(out_dir, ".render_limiter"), max_render_fps, temp_ceiling_c, batch)
     with open(os.path.join(out_dir, f"manifest-{split}.json"), "w") as f:
         json.dump({"template": job.template, "manifest": job.manifest, "split": split, "seeds": [seeds.start, seeds.stop],
-                   "backend": backend, "twins": twins, "max_render_fps": max_render_fps, "batch": batch}, f, indent=1)
+                   "backend": backend, "twins": list(twins), "max_render_fps": max_render_fps, "batch": batch}, f, indent=1)
 
     shards = Shards(out_dir)
     rows, n_rej = [], 0

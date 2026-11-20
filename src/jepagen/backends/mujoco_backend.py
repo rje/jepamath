@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import os
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -81,7 +83,7 @@ def build_mjcf(ep: Episode) -> str:
     {_tray_xml(sc.box)}
     {_tray_xml(sc.hopper)}
     <geom name="reserve_platform" type="box" pos="{(n_res - 1) * 0.15} 0 {RESERVE_Z - 0.05}" size="{n_res * 0.15 + 0.3} 0.3 0.05" rgba="0 0 0 1"/>
-    <body name="screen" mocap="true" pos="{s.center_x} {s.y} {SCREEN_DOWN_TOP_Z - s.height / 2}">
+    <body name="screen" mocap="true" pos="{s.center_x} {s.y} {SCREEN_DOWN_TOP_Z - s.height / 2}" quat="{math.cos(s.yaw / 2)} 0 0 {math.sin(s.yaw / 2)}">
       <geom name="screen" type="box" size="{s.width / 2} {s.thickness / 2} {s.height / 2}" rgba="{_f(s.color)}" material="flat" contype="0" conaffinity="0"/>
     </body>
     <body name="claw" mocap="true" pos="{_f(ep.physics.claw_home)}">
@@ -186,10 +188,13 @@ class MujocoBackend:
             q = self.obj_joint_qadr[oid]
             self.d.qpos[q:q + 3] = pos
             self.d.qpos[q + 3:q + 7] = (1, 0, 0, 0)
-        else:
+        elif v.kind == "delete":
             oid = pick_topmost(self.ep, "box", self._poses(), self.held)
             q = self.obj_joint_qadr[oid]
             self.d.qpos[q:q + 3] = (oid * 0.3, 0.0, RESERVE_Z + 0.1)
+        else:
+            raise NotImplementedError(f"{v.kind} violations are Rust-engine only (MuJoCo is the cross-check "
+                                      "for the original claw/screen mechanics)")
         va = self.obj_joint_vadr[oid]
         self.d.qvel[va:va + 6] = 0.0
         mujoco.mj_forward(self.m, self.d)

@@ -20,6 +20,7 @@ pub struct Tray {
 pub struct Screen {
     pub center_x: f64,
     pub y: f64,
+    pub yaw: f64, // rotation about z; 0 = panel in the x-z plane
     pub width: f64,
     pub height: f64,
     pub thickness: f64,
@@ -115,7 +116,7 @@ impl Action {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Violation {
-    pub kind: String, // "add" | "delete"
+    pub kind: String, // "add" | "delete" | "move" | "swap"
     pub t: f64,
     pub object_id: Option<usize>,
     pub pos: Option<V3>,
@@ -155,7 +156,7 @@ pub struct Episode {
     pub meta: serde_json::Value,
 }
 
-pub const SUPPORTED_SPEC_VERSION: &str = "0.1";
+pub const SUPPORTED_SPEC_VERSION: &str = "0.2";
 
 impl Episode {
     pub fn from_json(s: &str) -> Result<Self, String> {

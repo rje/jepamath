@@ -28,10 +28,11 @@ def clip_to_sample(clip: ClipResult, backend: str, validation_metrics: dict) -> 
 def index_row(clip: ClipResult, backend: str, shard_dir: str) -> dict:
     ep, m = clip.episode, clip.episode.meta
     return {"episode_id": ep.episode_id, "seed": ep.seed, "split": ep.split, "backend": backend,
-            "possible": ep.violation is None, "twin_of": ep.twin_of or "",
+            "possible": ep.violation is None, "twin_kind": ep.twin_kind, "twin_of": ep.twin_of or "",
             "violation": ep.violation.kind if ep.violation else "",
             "n0": m["n0"], "op": m["op"], "k": m["k"], "final": m["final"],
             "shown_final": m.get("shown_final", m["final"]), "control_mode": m["control_mode"],
+            "shuffles": m["shuffles"], "palette": m["palette"], "sampler": m["sampler"],
             "shard_dir": shard_dir}
 
 
@@ -48,7 +49,7 @@ def check_disk(path: str, needed_bytes: int) -> None:
 
 
 class Shards:
-    """One ShardWriter per (split, possible|impossible) directory, so impossible clips can never
+    """One ShardWriter per (split, possible|impossible|control) directory, so twins can never
     land in a training shard."""
 
     def __init__(self, out_dir: str, max_bytes: int = 1_000_000_000):
@@ -57,8 +58,7 @@ class Shards:
         self.writers: dict[str, wds.ShardWriter] = {}
 
     def dir_for(self, clip: ClipResult) -> str:
-        kind = "possible" if clip.episode.violation is None else "impossible"
-        return os.path.join(clip.episode.split, kind)
+        return os.path.join(clip.episode.split, clip.episode.twin_kind)
 
     def write(self, clip: ClipResult, sample: dict) -> str:
         d = self.dir_for(clip)

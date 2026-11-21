@@ -8,6 +8,7 @@ nvidia-smi --query-gpu=name,temperature.gpu,power.draw --format=csv,noheader
 python -m jepatrain.train --out $O/run2_l2pool --loss l2 --pool-weight 1.0 > $O/run2_l2pool.log 2>&1
 # run 1b: the V-JEPA-style L1 baseline, restarted after the GPU hang killed run 1
 python -m jepatrain.train --out $O/run1b_l1 > $O/run1b_l1.log 2>&1
-# re-evaluate every checkpoint (adds the pooled reveal score), then attentive probes on the final ones
-for r in run2_l2pool run1b_l1; do python -m jepatrain.reeval --run $O/$r >> $O/$r.log 2>&1; done
+# training-time evals already include the pooled score; only run 1's pre-hang checkpoints predate it
+python -m jepatrain.reeval --run $O/run1 >> $O/run1.log 2>&1
+# attentive probes on the final checkpoints
 for r in run2_l2pool run1b_l1; do python -m jepatrain.probe --run $O/$r --weights weights_030000.pt >> $O/$r.log 2>&1; done

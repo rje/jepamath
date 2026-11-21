@@ -247,8 +247,7 @@ def main():
                    **{k: sum(v) / len(v) for k, v in acc.items()}, "guard": guard.summary()}
             t_last, acc = now, {}
             logf.write(json.dumps(rec) + "\n"); logf.flush()
-            if step % (a.log_every * 10) == 0:
-                print(f"[train] {json.dumps(rec)}", flush=True)
+            print(f"[train] {json.dumps(rec)}", flush=True)  # every log: cloudrun reads progress from stdout
         if step % a.ckpt_every == 0 or step % a.eval_every == 0 or step == a.steps:
             save_ckpt()
         if step % a.eval_every == 0 or step == a.steps:

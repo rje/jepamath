@@ -196,10 +196,12 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
             time.sleep(job.watch.poll_s)
             now = time.time()
             try:
-                status = vast.status(inst)
+                status, billed = vast.poll(inst)
             except VastError as ex:          # an API hiccup is not evidence the box died; look again next poll
                 out(f"  vast API error (ignored this poll): {ex}")
                 continue
+            if billed is not None and billed > e["rate"]:   # account at what Vast bills, never below the bid
+                e["rate"] = billed
             hb = heartbeat(s3, project, job.name, ep)
             if hb and hb.get("step", 0) > ep_step:
                 ep_step, t_step = hb["step"], now

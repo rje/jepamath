@@ -318,6 +318,11 @@ class FakeVast:
             return None
         return q.pop(0) if len(q) > 1 else q[0]
 
+    def poll(self, inst):
+        return self.status(inst), self.billed
+
+    billed = None
+
     def instances(self):
         return [{"id": i, "actual_status": "running"} for i in self.live]
 
@@ -410,3 +415,16 @@ def test_final_flush_ships_a_file_written_a_moment_before_exit(tmp_path):
     assert "runs/j/run/result.json" not in s3.obj
     s.once(final=True)
     assert "runs/j/run/result.json" in s3.obj
+
+
+def test_spend_follows_the_billed_rate_not_the_bid(tmp_path, monkeypatch):
+    s3 = FakeS3()
+    vast = FakeVast([["running"]])
+    vast.billed = 0.40                     # bid 0.25 + disk/bandwidth
+    j = job(watch=Watch(poll_s=0))
+    p = Project(bucket="b", b2_env="", vast_env="", repo="o/r", state_dir=str(tmp_path))
+    s3.put_object("b", f"runs/{j.name}/heartbeat/ep000.json",
+                  json.dumps({"episode": 0, "step": 600, "exit_rc": 0, "phase": "done"}))
+    assert sup.run(j, p, vast, s3, B2Creds("k", "s", "e"), "c", out=lambda m: None) == "done"
+    st = json.loads((tmp_path / "t.json").read_text())
+    assert st["episodes"][0]["rate"] == 0.40

@@ -72,10 +72,16 @@ class Vast:
 
     def status(self, inst: int) -> str | None:
         """actual_status of the instance, or None if it is not listed."""
+        return self.poll(inst)[0]
+
+    def poll(self, inst: int) -> tuple[str | None, float | None]:
+        """(actual_status, billed $/h) of the instance; (None, None) if it is not listed.
+        The billed rate is `dph_total`: the GPU price plus disk and bandwidth, which the offer's bid omits."""
         for i in self.instances():
             if i.get("id") == inst:
-                return i.get("actual_status") or "unknown"
-        return None
+                dph = i.get("dph_total")
+                return i.get("actual_status") or "unknown", float(dph) if dph is not None else None
+        return None, None
 
     def destroy(self, inst: int, wait_s: float = 60) -> None:
         """Destroy, then confirm it is gone from the list. Raises if it is still listed: it is billing."""

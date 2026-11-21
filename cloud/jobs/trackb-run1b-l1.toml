@@ -18,6 +18,9 @@ local = "heldout"
 # small model (17.8M params, ~13 GB at batch 32); the data loader wants CPU cores, the held-out set ~14 GB RAM
 gpus = ["RTX 4090", "RTX 3090", "RTX A5000", "RTX A6000", "L40S", "RTX 6000Ada", "A100 PCIE", "A100 SXM4"]
 max_price_per_gpu = 0.40
+# rank by expected episode cost: 60 ckpts x 0.27 GB + 13 weights x 0.13 GB synced out per 30k-step run
+episode_hours = 4.0
+upload_gb = 18.0
 interruptible = true
 min_reliability = 0.98
 min_disk_gb = 80

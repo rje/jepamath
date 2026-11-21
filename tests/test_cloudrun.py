@@ -17,7 +17,7 @@ from cloudrun import supervisor as sup
 from cloudrun.config import Budget, Job, Machine, Project, Watch, load_job
 from cloudrun.creds import B2Creds, read_env_file
 from cloudrun.sync import Syncer, parse_log, rolling_to_prune
-from cloudrun.vast import eligible, planned_rate, rank
+from cloudrun.vast import bandwidth_usd, eligible, episode_cost, planned_rate, rank
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -319,9 +319,9 @@ class FakeVast:
         return q.pop(0) if len(q) > 1 else q[0]
 
     def poll(self, inst):
-        return self.status(inst), self.billed
+        return self.status(inst), self.billed, self.bw
 
-    billed = None
+    billed, bw = None, 0.0
 
     def instances(self):
         return [{"id": i, "actual_status": "running"} for i in self.live]
@@ -428,3 +428,31 @@ def test_spend_follows_the_billed_rate_not_the_bid(tmp_path, monkeypatch):
     assert sup.run(j, p, vast, s3, B2Creds("k", "s", "e"), "c", out=lambda m: None) == "done"
     st = json.loads((tmp_path / "t.json").read_text())
     assert st["episodes"][0]["rate"] == 0.40
+
+
+def test_rank_counts_the_data_pull_not_just_the_hourly_rate():
+    m = dc.replace(M, episode_hours=4.0, upload_gb=0.0)
+    cheap_gpu_dear_net = offer(id=1, min_bid=0.10, dph_total=0.9, inet_down_cost=0.05)   # 0.5 + 1.40
+    dearer_gpu_free_net = offer(id=2, min_bid=0.20, dph_total=0.9, inet_down_cost=0.0)   # 1.0
+    assert [o["id"] for _, _, o in rank([cheap_gpu_dear_net, dearer_gpu_free_net], m, down_gb=28)] == [2, 1]
+    assert [o["id"] for _, _, o in rank([cheap_gpu_dear_net, dearer_gpu_free_net], m, down_gb=0)] == [1, 2]
+    assert episode_cost(0.125, cheap_gpu_dear_net, m, 28) == 0.5 + 28 * 0.05
+
+
+def test_bandwidth_usd_from_instance_record():
+    i = {"inet_down_billed": 27682406.4, "inet_down_cost": 0.036458, "inet_up_billed": 5620367.36, "inet_up_cost": 0.03255}
+    assert abs(bandwidth_usd(i) - (27.68 * 0.036458 + 5.62 * 0.03255)) < 0.01
+    assert bandwidth_usd({}) == 0.0
+
+
+def test_spend_includes_bandwidth(tmp_path):
+    s3 = FakeS3()
+    vast = FakeVast([["running"]])
+    vast.bw = 1.25
+    j = job(watch=Watch(poll_s=0))
+    p = Project(bucket="b", b2_env="", vast_env="", repo="o/r", state_dir=str(tmp_path))
+    s3.put_object("b", f"runs/{j.name}/heartbeat/ep000.json",
+                  json.dumps({"episode": 0, "step": 600, "exit_rc": 0, "phase": "done"}))
+    assert sup.run(j, p, vast, s3, B2Creds("k", "s", "e"), "c", out=lambda m: None) == "done"
+    st = json.loads((tmp_path / "t.json").read_text())
+    assert st["episodes"][0]["bandwidth"] == 1.25 and st["spent"] >= 1.25

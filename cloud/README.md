@@ -21,8 +21,11 @@ python -m cloudrun destroy <id>
 
 1. `launch` requires a clean, pushed HEAD: the instance downloads exactly that commit from
    github.com/rje/jepamath (public, no credentials on the box for code).
-2. The supervisor ranks offers by the rate it would actually pay (interruptible bid = floor × 1.25,
-   capped at `max_price_per_gpu`; on-demand if within 10%), rents, and passes the job via env vars.
+2. The supervisor ranks offers by the expected cost of one episode: the rate it would actually pay
+   (interruptible bid = floor × 1.25, capped at `max_price_per_gpu`; on-demand if within 10%) ×
+   `episode_hours`, plus the host's per-GB bandwidth price × (data + run dir pulled, `upload_gb` pushed).
+   Bandwidth matters: at $0.036/GB the 27 GB pull alone is ~$1, more than hours of an A5000. Spend
+   (for `max_spend`) is the billed `dph_total` × hours plus the instance's billed bandwidth.
 3. On the box, `bootstrap.sh`: restore `runs/<job>/run/` from B2 → start the syncer → setup →
    pull `[[data]]` → run `command` → print `CLOUDRUN_EXIT rc=N` → final flush.
 4. The syncer mirrors `$RUN_DIR` to B2 every 60 s (stable files only), prunes `ckpt_*.pt` beyond the

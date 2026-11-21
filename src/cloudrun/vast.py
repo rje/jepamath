@@ -74,14 +74,14 @@ class Vast:
         """actual_status of the instance, or None if it is not listed."""
         return self.poll(inst)[0]
 
-    def poll(self, inst: int) -> tuple[str | None, float | None]:
-        """(actual_status, billed $/h) of the instance; (None, None) if it is not listed.
-        The billed rate is `dph_total`: the GPU price plus disk and bandwidth, which the offer's bid omits."""
+    def poll(self, inst: int) -> tuple[str | None, float | None, float]:
+        """(actual_status, billed $/h, bandwidth $ so far) of the instance; (None, None, 0) if not listed.
+        `dph_total` is the GPU price plus disk; bandwidth is billed separately per GB moved."""
         for i in self.instances():
             if i.get("id") == inst:
                 dph = i.get("dph_total")
-                return i.get("actual_status") or "unknown", float(dph) if dph is not None else None
-        return None, None
+                return i.get("actual_status") or "unknown", float(dph) if dph is not None else None, bandwidth_usd(i)
+        return None, None, 0.0
 
     def destroy(self, inst: int, wait_s: float = 60) -> None:
         """Destroy, then confirm it is gone from the list. Raises if it is still listed: it is billing."""
@@ -141,22 +141,37 @@ def planned_rate(o: dict, m: Machine) -> tuple[float, bool] | None:
     return bid, False
 
 
-def rank(offers: list[dict], m: Machine) -> list[tuple[float, bool, dict]]:
-    """Eligible offers as (rate, on_demand, offer), cheapest planned rate first."""
+def bandwidth_usd(inst: dict) -> float:
+    """Bandwidth billed so far on an instance. `inet_*_billed` count in units of 1e-6 GB, judged by the
+    account credit matching ~28 GB pulled per box at the listed $/GB."""
+    return sum((inst.get(f"inet_{d}_billed") or 0) / 1e6 * (inst.get(f"inet_{d}_cost") or 0) for d in ("down", "up"))
+
+
+def episode_cost(rate: float, o: dict, m: Machine, down_gb: float) -> float:
+    """Expected $ for one episode on this offer: GPU hours plus data in and checkpoints out."""
+    return (rate * m.episode_hours + down_gb * (o.get("inet_down_cost") or 0)
+            + m.upload_gb * (o.get("inet_up_cost") or 0))
+
+
+def rank(offers: list[dict], m: Machine, down_gb: float = 0.0) -> list[tuple[float, bool, dict]]:
+    """Eligible offers as (rate, on_demand, offer), cheapest expected episode first (see episode_cost)."""
     out = []
     for o in eligible(offers, m):
         r = planned_rate(o, m)
         if r is not None:
             out.append((r[0], r[1], o))
-    out.sort(key=lambda t: t[0])
+    out.sort(key=lambda t: episode_cost(t[0], t[2], m, down_gb))
     return out
 
 
-def fmt_offers(ranked: list[tuple[float, bool, dict]], n: int = 12) -> str:
-    lines = [f"{'offer':>10} {'gpu':<14} {'rate $/h':>8} {'kind':<6} {'floor':>6} {'od':>6} {'rel':>5} "
-             f"{'cpu':>4} {'ramG':>5} {'down':>6} {'cuda':>5}  location"]
+def fmt_offers(ranked: list[tuple[float, bool, dict]], n: int = 12, m: Machine | None = None,
+               down_gb: float = 0.0) -> str:
+    lines = [f"{'offer':>10} {'gpu':<14} {'rate $/h':>8} {'kind':<6} {'$/GB':>6} {'ep $':>6} {'floor':>6} {'od':>6} "
+             f"{'rel':>5} {'cpu':>4} {'ramG':>5} {'down':>6} {'cuda':>5}  location"]
     for rate, od, o in ranked[:n]:
+        ep = episode_cost(rate, o, m, down_gb) if m else float("nan")
         lines.append(f"{o['id']:>10} {o.get('gpu_name', '?')[:14]:<14} {rate:>8.3f} {'od' if od else 'bid':<6} "
+                     f"{o.get('inet_down_cost') or 0:>6.4f} {ep:>6.2f} "
                      f"{o.get('min_bid') or 0:>6.3f} {o.get('dph_total') or 0:>6.3f} {o.get('reliability2', 0):>5.3f} "
                      f"{o.get('cpu_cores_effective', 0):>4.0f} {(o.get('cpu_ram') or 0) / 1024:>5.0f} "
                      f"{o.get('inet_down', 0):>6.0f} {o.get('cuda_max_good', 0):>5} "

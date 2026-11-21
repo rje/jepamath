@@ -52,6 +52,10 @@ class Machine:
     min_cuda: float = 12.6              # host driver's max CUDA; the image needs at least this
     verified_only: bool = True
     image: str = "pytorch/pytorch:2.8.0-cuda12.6-cudnn9-runtime"
+    # offers are ranked by the cost of one episode, not the hourly rate: hosts charge per GB moved, and
+    # pulling the job's data onto a fresh box can cost more than hours of GPU time
+    episode_hours: float = 4.0          # expected GPU hours per episode
+    upload_gb: float = 0.0              # expected GB synced to B2 per episode (checkpoints, logs)
 
 
 @dc.dataclass(frozen=True)

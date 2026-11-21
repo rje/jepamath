@@ -186,7 +186,8 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
                     outcome = f"stop: spend cap ${st.d['spent']:.2f}"
                     break
                 ep = len(st.d["episodes"])
-                inst, rate, od, offer = provision(job, project, vast, creds, commit, ep, out)
+                inst, rate, od, offer = provision(job, project, vast, creds, commit, ep, out,
+                                                  data_gb(job, project, s3))
                 e = {"n": ep, "instance": inst, "rate": rate, "on_demand": od, "offer": offer["id"],
                      "gpu": offer.get("gpu_name"), "geo": offer.get("geolocation"), "start": time.time(),
                      "end": None, "end_reason": None, "max_step": 0, "commit": commit}
@@ -196,18 +197,19 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
             time.sleep(job.watch.poll_s)
             now = time.time()
             try:
-                status, billed = vast.poll(inst)
+                status, billed, bw = vast.poll(inst)
             except VastError as ex:          # an API hiccup is not evidence the box died; look again next poll
                 out(f"  vast API error (ignored this poll): {ex}")
                 continue
             if billed is not None and billed > e["rate"]:   # account at what Vast bills, never below the bid
                 e["rate"] = billed
+            e["bandwidth"] = max(e.get("bandwidth", 0.0), bw)
             hb = heartbeat(s3, project, job.name, ep)
             if hb and hb.get("step", 0) > ep_step:
                 ep_step, t_step = hb["step"], now
                 e["max_step"] = ep_step
                 any_progress = True
-            running = e["rate"] * (now - e["start"]) / 3600
+            running = e["rate"] * (now - e["start"]) / 3600 + e.get("bandwidth", 0.0)
             o = Obs(now=now, t_start=t_start, ep_start=e["start"], status=status, hb=hb, ep_step=ep_step,
                     t_step=t_step, spent=st.d["spent"] + running, any_progress=any_progress,
                     failures=st.d["failures"])
@@ -259,16 +261,23 @@ def _end_episode(st: State, e: dict, vast: Vast, inst: int, reason: str, out) ->
     if e["end"] is None:
         e["end"] = time.time()
         e["end_reason"] = reason
-        st.d["spent"] += e["rate"] * (e["end"] - e["start"]) / 3600
+        st.d["spent"] += e["rate"] * (e["end"] - e["start"]) / 3600 + e.get("bandwidth", 0.0)
     st.save()
 
 
-def provision(job: Job, project: Project, vast: Vast, creds: B2Creds, commit: str, ep: int, out):
+def data_gb(job, project, s3) -> float:
+    """GB a fresh box pulls: the job's data plus its run dir (restore)."""
+    prefixes = [project.key(d.remote) + "/" for d in job.data] + [project.key("runs", job.name, "run") + "/"]
+    return sum(sum(b2.remote_sizes(s3, project.bucket, p).values()) for p in prefixes) / 1e9
+
+
+def provision(job: Job, project: Project, vast: Vast, creds: B2Creds, commit: str, ep: int, out,
+              down_gb: float = 0.0):
     m = job.machine
-    ranked = rank(vast.search_all(m), m)
+    ranked = rank(vast.search_all(m), m, down_gb)
     if not ranked:
         raise RuntimeError(f"no offer for {m.gpus} at <= ${m.max_price_per_gpu}/GPU-h passes the filters")
-    out(fmt_offers(ranked, 5))
+    out(fmt_offers(ranked, 5, m=m, down_gb=down_gb))
     env = instance_env(job, project, creds, commit, ep)
     for rate, od, offer in ranked[:5]:
         # re-check the cap against the offer as rented, not as first listed

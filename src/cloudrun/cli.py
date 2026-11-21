@@ -28,7 +28,7 @@ from pathlib import Path
 from . import b2
 from .config import load_job, load_project
 from .creds import b2_from_file, read_env_file, vast_key
-from .supervisor import State, heartbeat, run
+from .supervisor import State, data_gb, heartbeat, run
 from .vast import Vast, fmt_offers, rank
 
 
@@ -81,10 +81,12 @@ def main(argv=None) -> int:
     if a.cmd in ("offers", "plan", "launch"):
         job = load_job(jobfile(a.job))
         vast = Vast(vast_key(project.vast_env))
-        ranked = rank(vast.search_all(job.machine), job.machine)
+        down_gb = data_gb(job, project, s3)
+        ranked = rank(vast.search_all(job.machine), job.machine, down_gb)
         print(f"{len(ranked)} eligible offers for {job.machine.gpus} x{job.machine.num_gpus} "
-              f"at <= ${job.machine.max_price_per_gpu}/GPU-h")
-        print(fmt_offers(ranked))
+              f"at <= ${job.machine.max_price_per_gpu}/GPU-h; ranked by expected episode $ "
+              f"({job.machine.episode_hours} h + {down_gb:.1f} GB in + {job.machine.upload_gb} GB out)")
+        print(fmt_offers(ranked, m=job.machine, down_gb=down_gb))
         if a.cmd == "offers":
             return 0
         commit = code_commit()

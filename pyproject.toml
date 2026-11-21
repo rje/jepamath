@@ -9,6 +9,9 @@ description = "Procedural video data generator for JEPA number-sense experiments
 requires-python = ">=3.11"
 dependencies = ["mujoco>=3.2", "numpy", "pydantic>=2", "pyyaml", "webdataset", "pyarrow", "scikit-learn", "imageio", "pillow", "torch", "transformers>=4.53"]
 
+[project.optional-dependencies]
+cloud = ["boto3"]
+
 [project.scripts]
 jepagen = "jepagen.cli:main"
 jepaeval = "jepaeval.cli:main"

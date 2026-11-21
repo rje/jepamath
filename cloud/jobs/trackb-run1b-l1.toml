@@ -1,0 +1,37 @@
+[job]
+name = "trackb-run1b-l1"
+command = "python -m jepatrain.train --out $RUN_DIR --data $DATA/v2_128 --heldout $DATA/heldout/v2_triples2000_128.pt --duty 1.0 --power-ceiling 5000 --workers 12 --auto-resume --loss l1"
+setup = ["pip install -q webdataset scikit-learn pyarrow pyyaml"]
+progress_regex = '"step": (\d+)'
+rolling = "ckpt_*.pt"
+keep_rolling = 2
+
+[[data]]
+remote = "data/v2_128"
+local = "v2_128"
+
+[[data]]
+remote = "data/heldout"
+local = "heldout"
+
+[machine]
+# small model (17.8M params, ~13 GB at batch 32); the data loader wants CPU cores, the held-out set ~14 GB RAM
+gpus = ["RTX 4090", "RTX 3090", "RTX A5000", "RTX A6000", "L40S", "RTX 6000Ada", "A100 PCIE", "A100 SXM4"]
+max_price_per_gpu = 0.40
+interruptible = true
+min_reliability = 0.98
+min_disk_gb = 80
+min_gpu_ram_gb = 20
+min_cpu_cores = 16
+min_ram_gb = 48
+min_inet_down_mbps = 500
+
+[budget]
+max_spend = 6.0
+max_hours = 10
+
+[watch]
+setup_grace_min = 40
+stall_min = 20
+poll_s = 60
+max_failures = 2

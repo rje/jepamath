@@ -1,0 +1,11 @@
+# cloudrun project config for jepamath (see cloud/README.md)
+# For now this project lives under jepamath/ in microlab's checkpoint bucket, using microlab's key (scoped to
+# that one bucket; the bucket already deletes superseded versions). For a dedicated bucket: create it and a
+# key scoped to it in the B2 console, then change bucket, b2_env and root here.
+bucket = "microlab-checkpoints"
+root = "jepamath"
+b2_env = "~/.config/microlab/b2_checkpoints.env"
+instance_b2_env = ""
+vast_env = "~/.config/microlab/vast.env"
+repo = "rje/jepamath"
+state_dir = "/mnt/data/jepamath/cloud/state"

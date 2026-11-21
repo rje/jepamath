@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import faulthandler
+import glob
 import json
 import math
 import os
@@ -29,6 +31,23 @@ from jepaeval.vjepa import IMAGENET_MEAN, IMAGENET_STD
 from .data import PossibleClips
 from .evaluate import TrainedSurprise, evaluate_all
 from .model import Encoder, Predictor
+
+
+def latest_ckpt(out: str) -> str | None:
+    cks = sorted(glob.glob(os.path.join(out, "ckpt_*.pt")))
+    return cks[-1] if cks else None
+
+
+def write_ckpt(out: str, step: int, state: dict, keep: int) -> str:
+    """Atomic (tmp + rename), so neither a resume nor the B2 syncer can see a half-written file.
+    Keeps the newest `keep` checkpoints."""
+    path = os.path.join(out, f"ckpt_{step:06d}.pt")
+    tmp = path + ".tmp"
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+    for old in sorted(glob.glob(os.path.join(out, "ckpt_*.pt")))[:-keep]:
+        os.remove(old)
+    return path
 
 
 def tube_mask(rng: random.Random, grid: int, n_blocks: int, scale: float) -> torch.Tensor:
@@ -94,7 +113,14 @@ def main():
     ap.add_argument("--power-ceiling", type=float, default=200.0)
     ap.add_argument("--temp-ceiling", type=float, default=83.0)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--ckpt-every", type=int, default=500, help="full-state checkpoint ckpt_<step>.pt cadence")
+    ap.add_argument("--keep-ckpts", type=int, default=2, help="local ckpt_*.pt files kept (newest)")
+    ap.add_argument("--resume", action="store_true", help="resume from the newest ckpt_*.pt in --out (must exist)")
+    ap.add_argument("--auto-resume", action="store_true",
+                    help="resume if --out holds a ckpt_*.pt, else start at step 0 (preemptible cloud runs)")
+    ap.add_argument("--hang-timeout", type=float, default=900,
+                    help="dump every thread's stack and exit if one step (or 3x this for an eval) takes longer; "
+                         "0 disables. py-spy/gdb cannot attach here (ptrace_scope=1), so this is the hang probe")
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
@@ -112,11 +138,14 @@ def main():
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": a.wd}, {"params": no_decay, "weight_decay": 0}],
                             lr=a.lr, betas=(0.9, 0.95))
     step = 0
-    ck_path = os.path.join(a.out, "last.pt")
-    if a.resume:
+    ck_path = latest_ckpt(a.out)
+    if a.resume and ck_path is None:
+        raise FileNotFoundError(f"--resume: no ckpt_*.pt in {a.out}")
+    if (a.resume or a.auto_resume) and ck_path is not None:
         ck = torch.load(ck_path, map_location=dev, weights_only=False)
         enc.load_state_dict(ck["enc"]); pred.load_state_dict(ck["pred"]); tgt.load_state_dict(ck["tgt"])
         opt.load_state_dict(ck["opt"]); step = ck["step"]; rng.setstate(ck["rng"])
+        print(f"[train] resumed from {ck_path} at step {step}", flush=True)
     with open(os.path.join(a.out, "args.json"), "w") as f:
         json.dump(vars(a), f, indent=1)
     n_params = sum(p.numel() for p in params)
@@ -145,7 +174,17 @@ def main():
         q = (s - a.warmup) / max(1, a.steps - a.warmup)
         return 1e-6 + (a.lr - 1e-6) * 0.5 * (1 + math.cos(math.pi * q))
 
+    def save_ckpt():
+        state = {"enc": enc.state_dict(), "pred": pred.state_dict(), "tgt": tgt.state_dict(),
+                 "opt": opt.state_dict(), "step": step, "rng": rng.getstate()}
+        write_ckpt(a.out, step, state, a.keep_ckpts)
+
+    def arm(mult=1.0):
+        if a.hang_timeout:
+            faulthandler.dump_traceback_later(a.hang_timeout * mult, exit=True)
+
     def do_eval():
+        arm(3)
         t0 = time.monotonic()
         r = evaluate_all(sj, triples)
         torch.save(r["raw"], os.path.join(a.out, f"eval_raw_{step:06d}.pt"))
@@ -161,6 +200,7 @@ def main():
         do_eval()
     enc.train(); pred.train()
     while step < a.steps:
+        arm()
         clips = next(it).to(dev, non_blocking=True)
         kind, ctx, tg = sample_masks(rng, enc.slots, enc.grid, a.p_prefix)
         B = clips.shape[0]
@@ -209,10 +249,12 @@ def main():
             logf.write(json.dumps(rec) + "\n"); logf.flush()
             if step % (a.log_every * 10) == 0:
                 print(f"[train] {json.dumps(rec)}", flush=True)
+        if step % a.ckpt_every == 0 or step % a.eval_every == 0 or step == a.steps:
+            save_ckpt()
         if step % a.eval_every == 0 or step == a.steps:
-            torch.save({"enc": enc.state_dict(), "pred": pred.state_dict(), "tgt": tgt.state_dict(),
-                        "opt": opt.state_dict(), "step": step, "rng": rng.getstate()}, ck_path)
             do_eval()
+    faulthandler.cancel_dump_traceback_later()
+    print(f"[train] finished at step {step}", flush=True)
 
 
 if __name__ == "__main__":

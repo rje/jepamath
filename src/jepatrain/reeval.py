@@ -17,7 +17,8 @@ from .model import Encoder, Predictor
 
 def load_run(run: str, weights: str, device: str = "cuda"):
     args = json.load(open(os.path.join(run, "args.json")))
-    mk = lambda: Encoder(dim=args["dim"], depth=args["depth"], heads=args["dim"] // 64).to(device)
+    mk = lambda: Encoder(img=args["res"], patch=args["patch"], dim=args["dim"], depth=args["depth"],
+                         heads=args["dim"] // 64).to(device)
     enc, tgt = mk(), mk()
     pred = Predictor(enc, dim=args["pred_dim"], depth=args["pred_depth"], heads=args["pred_dim"] // 32).to(device)
     w = torch.load(os.path.join(run, weights), map_location=device)
@@ -29,7 +30,7 @@ def main():
     ap = argparse.ArgumentParser(prog="jepatrain.reeval")
     ap.add_argument("--run", required=True)
     ap.add_argument("--weights", nargs="*", help="default: every weights_*.pt not yet in reeval.jsonl")
-    ap.add_argument("--heldout", default="/mnt/data/jepamath/heldout/v2_triples2000_128.pt")
+    ap.add_argument("--heldout", required=True)
     ap.add_argument("--duty", type=float, default=0.5)
     a = ap.parse_args()
     out = os.path.join(a.run, "reeval.jsonl")

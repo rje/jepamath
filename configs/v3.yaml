@@ -1,0 +1,5 @@
+# v3: v2 plus transfers the model can watch (visible, mixed) and larger objects.
+# Twins (impossible, control) are made only of occluded episodes; evaluation stays on those.
+visibility_modes: [occluded, visible, mixed]
+visibility_weights: [0.34, 0.33, 0.33]
+radius_range: [0.020, 0.036]

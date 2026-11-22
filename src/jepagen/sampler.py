@@ -15,7 +15,7 @@ from .spec import (
     Violation,
 )
 
-SAMPLER_VERSION = "v2"
+SAMPLER_VERSION = "v3"
 RESERVE_Z = -3.0  # must match backends.base.RESERVE_Z
 CLAW_PAD_HALF_Z = 0.006  # must match backends.base.CLAW_PAD_HALF[2]
 PILE_H = 0.09     # height above the box floor the screen must hide (validator catches taller piles)
@@ -68,6 +68,12 @@ class Template(_Strict):
     control_modes: tuple[Literal["size_matched", "area_matched"], ...] = ("size_matched", "area_matched")
     area_ref_count: int = 5      # area_matched: total area equals this many objects at mid radius
     use_screen: bool = True
+    # occluded: every transfer behind the raised screen (the twins' setting, v2)
+    # visible:  the screen never rises; every transfer in view
+    # mixed:    the first transfer in view, then the screen rises for the rest (needs >= 2 transfers;
+    #           episodes with one transfer draw from the other modes)
+    visibility_modes: tuple[Literal["occluded", "visible", "mixed"], ...] = ("occluded",)
+    visibility_weights: tuple[float, ...] = (1.0,)
     transfer_s: tuple[float, float] = (1.6, 2.0)
     screen_move_s: tuple[float, float] = (0.3, 0.5)
     clip: Clip = Clip(n_frames=32, fps=4, width=256, height=256)
@@ -78,6 +84,12 @@ class Template(_Strict):
     def _fits(self) -> "Template":
         if len(self.op_weights) != len(self.ops):
             raise ValueError("op_weights must match ops")
+        if len(self.visibility_weights) != len(self.visibility_modes):
+            raise ValueError("visibility_weights must match visibility_modes")
+        if not self.use_screen and self.visibility_modes != ("visible",):
+            raise ValueError("use_screen=False needs visibility_modes=('visible',)")
+        if self.visibility_modes == ("mixed",):
+            raise ValueError("mixed alone cannot serve one-transfer episodes; add occluded or visible")
         if self.k_range[1] > self.max_transfers:
             raise ValueError("k_range exceeds max_transfers")
         sm = self.screen_move_s[1]
@@ -440,13 +452,28 @@ def sample_episode(t: Template, man: Manifest, split: str, seed: int) -> Episode
         return (float(tray.center[0] + rng.uniform(-tray.inner_size[0] / 2 + m, tray.inner_size[0] / 2 - m)),
                 float(tray.center[1] + rng.uniform(-tray.inner_size[1] / 2 + m, tray.inner_size[1] / 2 - m)))
 
-    actions = []
-    tt = float(rng.uniform(0.4, 0.9))
-    if t.use_screen:
+    if t.visibility_modes == ("occluded",):
+        vis = "occluded"   # no draw: v2 episodes stay identical for the same seed
+    else:
+        modes = [(m, w) for m, w in zip(t.visibility_modes, t.visibility_weights) if m != "mixed" or len(order) >= 2]
+        w = np.array([w for _, w in modes], dtype=float)
+        if w.sum() <= 0:
+            raise ValueError(f"no visibility mode with weight > 0 for a {len(order)}-transfer episode: "
+                             f"{dict(zip(t.visibility_modes, t.visibility_weights))}")
+        vis = str(rng.choice([m for m, _ in modes], p=w / w.sum()))
+
+    def raise_screen(tt: float) -> float:
         sm = float(rng.uniform(*t.screen_move_s))
         actions.append(ScreenMove(kind="screen_raise", t_start=tt, t_end=tt + sm))
-        tt += sm + float(rng.uniform(0.1, 0.4))
-    for m_ in order:
+        return tt + sm + float(rng.uniform(0.1, 0.4))
+
+    actions = []
+    tt = float(rng.uniform(0.4, 0.9))
+    if vis == "occluded":
+        tt = raise_screen(tt)
+    for i_m, m_ in enumerate(order):
+        if vis == "mixed" and i_m == 1:
+            tt = raise_screen(tt)
         if m_ == "op":
             src, dst = ("hopper", "box") if op == "add" else ("box", "hopper")
         else:
@@ -455,7 +482,7 @@ def sample_episode(t: Template, man: Manifest, split: str, seed: int) -> Episode
         actions.append(Transfer(src=src, dst=dst, t_start=tt, t_end=tt + d, drop_xy=drop_xy(box if dst == "box" else hopper)))
         tt += d + 0.1
     last_transfer_end = tt - 0.1
-    if t.use_screen:
+    if vis != "visible":
         tt += float(rng.uniform(0.4, 0.7))
         sm = float(rng.uniform(*t.screen_move_s))
         actions.append(ScreenMove(kind="screen_lower", t_start=tt, t_end=tt + sm))
@@ -467,7 +494,7 @@ def sample_episode(t: Template, man: Manifest, split: str, seed: int) -> Episode
         episode_id=f"{split}-{seed:09d}", seed=seed, episode_type="transfer", split=split, scene=scene,
         objects=objects, actions=actions, clip=t.clip, physics=physics,
         meta={"sampler": SAMPLER_VERSION, "n0": n0, "op": op, "k": k, "final": final, "shuffles": n_shuf,
-              "control_mode": mode, "base_radius": base_r, "palette": palette, "shapes": ep_shapes,
+              "visibility": vis, "control_mode": mode, "base_radius": base_r, "palette": palette, "shapes": ep_shapes,
               "n_hopper": n_hopper, "last_transfer_end": last_transfer_end, "scene": scene_params},
     )
 
@@ -485,6 +512,8 @@ def make_twin(ep: Episode, seed: int, kind: Literal["impossible", "control"] = "
     """
     if ep.violation is not None:
         raise ValueError("already a twin")
+    if ep.meta["visibility"] != "occluded":
+        raise ValueError(f"twins are made only of occluded episodes, not {ep.meta['visibility']}")
     rng = np.random.default_rng([seed, 7 if kind == "impossible" else 11])
     lower = next(a for a in ep.actions if isinstance(a, ScreenMove) and a.kind == "screen_lower")
     lo, hi = ep.meta["last_transfer_end"] + 0.15, lower.t_start - 0.15

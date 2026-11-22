@@ -37,6 +37,7 @@ def index_row(clip: ClipResult, backend: str, shard_dir: str) -> dict:
             "n0": m["n0"], "op": m["op"], "k": m["k"], "final": m["final"],
             "shown_final": m.get("shown_final", m["final"]), "control_mode": m["control_mode"],
             "shuffles": m["shuffles"], "palette": m["palette"], "sampler": m["sampler"],
+            "visibility": m["visibility"],
             "shard_dir": shard_dir}
 
 

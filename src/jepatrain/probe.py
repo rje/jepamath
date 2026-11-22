@@ -30,14 +30,17 @@ from .evaluate import FPS, TrainedSurprise
 from .model import Encoder, Predictor
 
 
-def train_clips(data: str, exclude: set[str], n: int, split: str = "train"):
+def train_clips(data: str, exclude: set[str], n: int, res: int, split: str = "train"):
+    """First n possible clips with a screen reveal (visible-only clips have none), at `res` px."""
     shards = sorted(glob.glob(os.path.join(data, split, "possible", "*.tar")))
     out = []
     for s in wds.WebDataset(shards, shardshuffle=False, empty_check=False):
         if s["__key__"] in exclude:
             continue
         ep = json.loads(s["episode.json"])
-        out.append((downsample(np.load(io.BytesIO(s["clip.npz"]))["frames"]), ep))
+        if not any(a.get("kind") == "screen_lower" for a in ep["actions"]):
+            continue
+        out.append((downsample(np.load(io.BytesIO(s["clip.npz"]))["frames"], res), ep))
         if len(out) == n:
             return out
     raise RuntimeError(f"only {len(out)} training clips found, wanted {n}")
@@ -103,14 +106,16 @@ def main():
     ap.add_argument("--run", required=True)
     ap.add_argument("--weights", required=True, help="weights_XXXXXX.pt in the run dir")
     ap.add_argument("--data", default="/mnt/data/jepamath/v2")
-    ap.add_argument("--heldout", default="/mnt/data/jepamath/heldout/v2_triples2000_128.pt")
+    ap.add_argument("--heldout", required=True)
     ap.add_argument("--n-train", type=int, default=4000)
     ap.add_argument("--duty", type=float, default=0.5)
     a = ap.parse_args()
     args = json.load(open(os.path.join(a.run, "args.json")))
-    enc = Encoder(dim=args["dim"], depth=args["depth"], heads=args["dim"] // 64).cuda()
+    mk = lambda: Encoder(img=args["res"], patch=args["patch"], dim=args["dim"], depth=args["depth"],
+                         heads=args["dim"] // 64).cuda()
+    enc = mk()
     pred = Predictor(enc, dim=args["pred_dim"], depth=args["pred_depth"], heads=args["pred_dim"] // 32).cuda()
-    tgt = Encoder(dim=args["dim"], depth=args["depth"], heads=args["dim"] // 64).cuda()
+    tgt = mk()
     w = torch.load(os.path.join(a.run, a.weights), map_location="cuda")
     enc.load_state_dict(w["enc"]); pred.load_state_dict(w["pred"]); tgt.load_state_dict(w["tgt"])
     for m in (enc, pred, tgt):
@@ -118,7 +123,7 @@ def main():
     sj = TrainedSurprise(enc, tgt, pred, ComputeGuard(duty=a.duty))
     triples = torch.load(a.heldout, weights_only=False)
     exclude = {t["seed_id"] for t in triples}
-    tr = train_clips(a.data, exclude, a.n_train)
+    tr = train_clips(a.data, exclude, a.n_train, args["res"])
     te = [(t["possible"], t["pos_episode"]) for t in triples]
 
     def feats(clips):

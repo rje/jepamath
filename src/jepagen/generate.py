@@ -42,10 +42,13 @@ def _limiter(job: Job) -> RenderLimiter:
 
 
 def _episodes_for(job: Job, t: Template, m: Manifest, seed: int) -> list:
-    """The possible episode followed by its twins. Control twins are skipped when the box ends empty
-    (nothing to move or swap); that is the only case a requested twin is not made."""
+    """The possible episode followed by its twins. Twins are made only of occluded episodes (visible and
+    mixed ones are training clips with no hidden change), and control twins are skipped when the box ends
+    empty (nothing to move or swap)."""
     ep = sample_episode(t, m, job.split, seed)
     out = [ep]
+    if ep.meta["visibility"] != "occluded":
+        return out
     for kind in job.twins:
         if kind == "control" and not can_control(ep):
             continue

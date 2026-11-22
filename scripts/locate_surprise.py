@@ -124,7 +124,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("runs", nargs="+")
     ap.add_argument("--weights", nargs="+", required=True, help="evaluated for every run")
-    ap.add_argument("--heldout", default="/mnt/data/jepamath/heldout/v2_triples2000_128.pt")
+    ap.add_argument("--heldout", required=True)
     ap.add_argument("--n", type=int, default=1000)
     ap.add_argument("--thresh", type=int, default=30, help="per-pixel max-channel diff (0-255) to count as changed")
     ap.add_argument("--min-frac", type=float, default=0.15, help="fraction of a patch's pixels that must change")

@@ -13,10 +13,10 @@ import torch
 import torch.nn.functional as F
 import webdataset as wds
 
-RES = 128
+FRAME_KEYS = ("possible", "impossible", "control")
 
 
-def downsample(frames: np.ndarray, res: int = RES) -> np.ndarray:
+def downsample(frames: np.ndarray, res: int) -> np.ndarray:
     """uint8 [T, H, W, 3] -> uint8 [T, res, res, 3], antialiased bilinear (as jepaeval preprocess does)."""
     if frames.shape[1] == res and frames.shape[2] == res:
         return frames
@@ -27,11 +27,33 @@ def downsample(frames: np.ndarray, res: int = RES) -> np.ndarray:
     return x.round().clamp(0, 255).byte().permute(0, 2, 3, 1).numpy()
 
 
-def build_heldout(data: str, out: str, n: int, split: str = "train") -> None:
-    """First n twin triples (the same seeds jepaeval's reveal eval uses), downsampled, saved for reuse.
-    Their seeds are excluded from training."""
+def pack(frames: np.ndarray) -> bytes:
+    buf = io.BytesIO()
+    np.savez_compressed(buf, frames=frames)
+    return buf.getvalue()
+
+
+class PackedTriple(dict):
+    """A held-out triple whose clips are stored as compressed npz bytes and decoded on each access.
+    2,000 triples at 256 px are ~90 GB raw, too much to hold in RAM; the flat renders compress well."""
+
+    def __getitem__(self, k):
+        v = super().__getitem__(k)
+        return np.load(io.BytesIO(v))["frames"] if k in FRAME_KEYS else v
+
+
+def heldout_res(triples: list[dict]) -> int:
+    h, w = triples[0]["possible"].shape[1:3]
+    if h != w:
+        raise ValueError(f"non-square held-out frames {h}x{w}")
+    return int(h)
+
+
+def build_heldout(data: str, out: str, n: int, res: int, split: str = "train") -> None:
+    """First n twin triples (the same seeds jepaeval's reveal eval uses), at `res` px, clips compressed
+    (PackedTriple), saved for reuse. Their seeds are excluded from training."""
     from jepaeval.twins import load_triples
-    triples = load_triples(data, split, n, transform=downsample)
+    triples = [PackedTriple(t) for t in load_triples(data, split, n, transform=lambda f: pack(downsample(f, res)))]
     os.makedirs(os.path.dirname(out), exist_ok=True)
     torch.save(triples, out)
     with open(out + ".ids.json", "w") as f:
@@ -39,14 +61,15 @@ def build_heldout(data: str, out: str, n: int, split: str = "train") -> None:
 
 
 class PossibleClips(torch.utils.data.IterableDataset):
-    """Endless stream of possible clips (uint8 [T, RES, RES, 3]) from v2 shards, minus held-out seeds.
+    """Endless stream of possible clips (uint8 [T, res, res, 3]) from v2 shards, minus held-out seeds.
     Shards are split across workers and reshuffled every pass; a buffer shuffles clips within a worker."""
 
-    def __init__(self, data: str, exclude_ids: set[str], split: str = "train", buffer: int = 256, seed: int = 0):
+    def __init__(self, data: str, exclude_ids: set[str], res: int, split: str = "train", buffer: int = 256,
+                 seed: int = 0):
         self.shards = sorted(glob.glob(os.path.join(data, split, "possible", "*.tar")))
         if not self.shards:
             raise FileNotFoundError(f"no possible shards under {data}/{split}")
-        self.exclude, self.buffer, self.seed = exclude_ids, buffer, seed
+        self.exclude, self.buffer, self.seed, self.res = exclude_ids, buffer, seed, res
 
     def __iter__(self):
         torch.set_num_threads(1)
@@ -66,8 +89,23 @@ class PossibleClips(torch.utils.data.IterableDataset):
                 if s["__key__"] in self.exclude:
                     continue
                 frames = np.load(io.BytesIO(s["clip.npz"]))["frames"]
-                buf.append(torch.from_numpy(downsample(frames)))
+                buf.append(torch.from_numpy(downsample(frames, self.res)))
                 if len(buf) >= self.buffer:
                     yield buf.pop(rng.randrange(len(buf)))
             if seen == 0:
                 raise RuntimeError(f"worker {wid}: a full pass over {mine} yielded no samples")
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(prog="jepatrain.data", description="build the held-out triple set")
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--n", type=int, default=2000)
+    ap.add_argument("--res", type=int, required=True)
+    a = ap.parse_args()
+    build_heldout(a.data, a.out, a.n, a.res)
+
+
+if __name__ == "__main__":
+    main()

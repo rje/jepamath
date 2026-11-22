@@ -136,3 +136,58 @@ def test_trackb_masks_and_prefix_encoding():
         a = enc(x[:, :, :8])
         b = enc(x, keep=torch.arange(512)[None])
     assert torch.allclose(a, b, atol=1e-5)
+
+
+def test_default_template_reproduces_v2():
+    # v2's seed 0 (from its episode metadata): the occluded-only default draws nothing new
+    ep = sample_episode(Template(), Manifest(), "train", 0)
+    assert ep.meta["visibility"] == "occluded"
+    assert ep.meta["scene"]["cam_distance"] == pytest.approx(1.0277857194974376, abs=1e-12)
+
+
+def test_visibility_modes():
+    from jepagen.spec import ScreenMove, Transfer
+    m = Manifest()
+    seen = set()
+    for vis in ("visible", "mixed"):
+        t = Template(visibility_modes=("occluded", vis), visibility_weights=(0.2, 0.8))
+        for seed in range(40):
+            ep = sample_episode(t, m, "train", seed)
+            v = ep.meta["visibility"]
+            seen.add(v)
+            acts = sorted(ep.actions, key=lambda a: a.t_start)
+            screen = [a.kind for a in acts if isinstance(a, ScreenMove)]
+            transfers = [a for a in acts if isinstance(a, Transfer)]
+            if v == "visible":
+                assert screen == []
+                assert not any(ep.box_occluded_at(a.t_end) for a in transfers)
+                with pytest.raises(ValueError, match="only of occluded"):
+                    make_twin(ep, seed)
+            elif v == "mixed":
+                assert screen == ["screen_raise", "screen_lower"]
+                assert not ep.box_occluded_at(transfers[0].t_end)
+                assert all(ep.box_occluded_at(a.t_end) for a in transfers[1:])
+            else:
+                assert screen == ["screen_raise", "screen_lower"]
+    assert {"visible", "mixed", "occluded"} <= seen
+
+
+def test_mixed_alone_rejected():
+    with pytest.raises(ValueError, match="mixed alone"):
+        Template(visibility_modes=("mixed",), visibility_weights=(1.0,))
+
+
+def test_packed_triple_roundtrip():
+    from jepatrain.data import PackedTriple, heldout_res, pack
+    f = np.random.default_rng(0).integers(0, 255, (4, 16, 16, 3), dtype=np.uint8)
+    t = PackedTriple({"possible": pack(f), "impossible": pack(f[::-1]), "control": pack(f), "seed_id": "x"})
+    assert np.array_equal(t["possible"], f) and np.array_equal(t["impossible"], f[::-1])
+    assert t["seed_id"] == "x" and heldout_res([t]) == 16
+
+
+def test_encoder_256_tokens():
+    import torch
+    from jepatrain.model import Encoder
+    e = Encoder(img=256, patch=8, frames=8, tubelet=4, dim=64, depth=1, heads=2)
+    assert e.tokens_per_slot == 32 * 32
+    assert e(torch.zeros(1, 3, 8, 256, 256)).shape == (1, 2 * 1024, 64)

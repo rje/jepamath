@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from jepaeval.guard import ComputeGuard
 from jepaeval.vjepa import IMAGENET_MEAN, IMAGENET_STD
 
-from .data import PossibleClips
+from .data import PossibleClips, heldout_res
 from .evaluate import TrainedSurprise, evaluate_all
 from .model import Encoder, Predictor
 
@@ -78,7 +78,7 @@ def sample_masks(rng: random.Random, slots: int, grid: int, p_prefix: float):
     return kind, idx[~tgt], idx[tgt]
 
 
-def per_slot(tgt_idx: torch.Tensor, tokens_per_slot: int = 256) -> int:
+def per_slot(tgt_idx: torch.Tensor, tokens_per_slot: int) -> int:
     """Number of target tokens in each slot; raises unless every slot that has targets has the same number."""
     counts = torch.bincount(tgt_idx // tokens_per_slot)
     counts = counts[counts > 0]
@@ -90,7 +90,9 @@ def per_slot(tgt_idx: torch.Tensor, tokens_per_slot: int = 256) -> int:
 def main():
     ap = argparse.ArgumentParser(prog="jepatrain")
     ap.add_argument("--data", default="/mnt/data/jepamath/v2")
-    ap.add_argument("--heldout", default="/mnt/data/jepamath/heldout/v2_triples2000_128.pt")
+    ap.add_argument("--heldout", required=True, help="held-out triples at --res (jepatrain.data.build_heldout)")
+    ap.add_argument("--res", type=int, required=True, help="input px; v2 is rendered at 256")
+    ap.add_argument("--patch", type=int, default=8)
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=30000)
     ap.add_argument("--batch", type=int, default=32)
@@ -129,7 +131,7 @@ def main():
     dev = "cuda"
     guard = ComputeGuard(duty=a.duty, temp_ceiling_c=a.temp_ceiling, power_ceiling_w=a.power_ceiling)
 
-    enc = Encoder(dim=a.dim, depth=a.depth, heads=a.dim // 64).to(dev)
+    enc = Encoder(img=a.res, patch=a.patch, dim=a.dim, depth=a.depth, heads=a.dim // 64).to(dev)
     pred = Predictor(enc, dim=a.pred_dim, depth=a.pred_depth, heads=a.pred_dim // 32).to(dev)
     tgt = copy.deepcopy(enc).requires_grad_(False)
     params = [p for m in (enc, pred) for p in m.parameters()]
@@ -154,13 +156,15 @@ def main():
     # start the loader workers before the held-out set is in memory, so forked workers don't carry it
     with open(a.heldout + ".ids.json") as f:
         exclude = set(json.load(f))
-    loader = torch.utils.data.DataLoader(PossibleClips(a.data, exclude, seed=a.seed + step), batch_size=a.batch,
+    loader = torch.utils.data.DataLoader(PossibleClips(a.data, exclude, a.res, seed=a.seed + step), batch_size=a.batch,
                                          num_workers=a.workers, pin_memory=True, persistent_workers=True,
                                          prefetch_factor=4)
     it = iter(loader)
     triples = torch.load(a.heldout, weights_only=False)
     if {t["seed_id"] for t in triples} != exclude:
         raise RuntimeError("held-out ids file does not match the held-out triples")
+    if heldout_res(triples) != a.res:
+        raise ValueError(f"held-out set is {heldout_res(triples)} px but --res is {a.res}")
     mean = torch.tensor(IMAGENET_MEAN, device=dev).view(1, 3, 1, 1, 1)
     std = torch.tensor(IMAGENET_STD, device=dev).view(1, 3, 1, 1, 1)
     sj = TrainedSurprise(enc, tgt, pred, guard)

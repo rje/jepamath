@@ -1,7 +1,7 @@
 [job]
 name = "trackb-dropunit-128-cw50"
 command = "python -m jepatrain.train --out $RUN_DIR --data $DATA/drop_unit_128 --heldout $DATA/heldout_v4_128/v4_triples2000_128.pt --res 128 --duty 1.0 --power-ceiling 5000 --workers 10 --auto-resume --loss l2 --pool-weight 1.0 --change-weight 50 --p-prefix 0.8 && python scripts/visible_drop.py $RUN_DIR --weights weights_015000.pt weights_030000.pt --data $DATA/drop_unit_test --n 400 --out $RUN_DIR/visdrop --device cuda"
-setup = ["pip install -q webdataset scikit-learn pyarrow pyyaml"]
+setup = ["pip install -q webdataset scikit-learn pyarrow pyyaml pydantic"]
 progress_regex = '"step": (\d+)'
 rolling = "ckpt_*.pt"
 keep_rolling = 2

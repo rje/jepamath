@@ -1,7 +1,7 @@
 [job]
 name = "trackb-v4-256-l2pool"
 command = "python -m jepatrain.train --out $RUN_DIR --data $DATA/v4_256 --heldout $DATA/heldout_v4_256/v4_triples2000_256.pt --res 256 --duty 1.0 --power-ceiling 5000 --workers 12 --auto-resume --loss l2 --pool-weight 1.0 && python scripts/locate_surprise.py $RUN_DIR --weights weights_015000.pt weights_030000.pt --heldout $DATA/heldout_v4_256/v4_triples2000_256.pt --out $RUN_DIR/locate --device cuda && python scripts/visible_drop.py $RUN_DIR --weights weights_015000.pt weights_030000.pt --data $DATA/v4_vistest --n 400 --out $RUN_DIR/visdrop --device cuda"
-setup = ["pip install -q webdataset scikit-learn pyarrow pyyaml"]
+setup = ["pip install -q webdataset scikit-learn pyarrow pyyaml pydantic"]
 progress_regex = '"step": (\d+)'
 rolling = "ckpt_*.pt"
 keep_rolling = 2

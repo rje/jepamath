@@ -81,17 +81,43 @@ def _judge(job: Job, seed: int, eps: list, results: list) -> dict:
     return out
 
 
+# The one simulation failure that is a property of the episode, not a bug: an object knocked out of a tray
+# before the claw comes for it (large objects, v4). The seed is rejected with this reason, like a failed check.
+SIM_REJECT = "claw: no object in region"
+
+
+def _sim_rejected(job: Job, seed: int, eps: list, err: Exception) -> dict:
+    return {"seed": seed, "episode_id": eps[0].episode_id, "accepted": [],
+            "rejected": [{"episode_id": eps[0].episode_id, "reasons": [f"simulation: {err}"]}]}
+
+
 def produce_group(job: Job, seeds: list[int]) -> list[dict]:
     """Runs several seeds and their twins. With job.batch > 1 every frame of every clip in the group
-    is one GPU submission; the clips are identical either way."""
+    is one GPU submission; the clips are identical either way. If the batch hits SIM_REJECT, the group is
+    rerun seed by seed so only the failing seed is rejected."""
     t, m = Template.model_validate(job.template), Manifest.model_validate(job.manifest)
     lim = _limiter(job)
     groups = [_episodes_for(job, t, m, s) for s in seeds]
     flat = [e for g in groups for e in g]
-    if job.batch > 1:
-        res = run_episodes_batched(flat, lim)
-    else:
-        res = [run_episode(e, job.backend, lim) for e in flat]
+    try:
+        if job.batch > 1:
+            res = run_episodes_batched(flat, lim)
+        else:
+            res = [run_episode(e, job.backend, lim) for e in flat]
+    except RuntimeError as err:
+        if SIM_REJECT not in str(err):
+            raise
+        outs = []
+        for s, g in zip(seeds, groups):
+            try:
+                r = run_episodes_batched(g, lim) if job.batch > 1 else [run_episode(e, job.backend, lim) for e in g]
+            except RuntimeError as e2:
+                if SIM_REJECT not in str(e2):
+                    raise
+                outs.append(_sim_rejected(job, s, g, e2))
+                continue
+            outs.append(_judge(job, s, g, r))
+        return outs
     outs, i = [], 0
     for s, g in zip(seeds, groups):
         outs.append(_judge(job, s, g, res[i:i + len(g)]))

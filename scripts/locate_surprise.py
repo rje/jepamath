@@ -13,7 +13,8 @@ Run on step-0 weights too: objects may be harder to predict than table whatever 
 frames are the last frame before the screen rose (the box as last seen). M is where that differs from the true
 possible ending (the transferred objects). d_twin < d_pos there means the prediction is the stale snapshot.
 
-    CUDA_VISIBLE_DEVICES= python scripts/locate_surprise.py RUN_DIR --weights weights_030000.pt --out OUT
+    CUDA_VISIBLE_DEVICES= python scripts/locate_surprise.py RUN_DIR --weights weights_030000.pt --heldout H --out OUT
+    python scripts/locate_surprise.py RUN_DIR --weights ... --heldout H --out OUT --device cuda   (256 px: use a GPU)
 """
 from __future__ import annotations
 
@@ -35,6 +36,7 @@ from jepatrain.reeval import load_run  # noqa: E402
 FPS = 4.0
 MEAN = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1, 1)
 STD = torch.tensor(IMAGENET_STD).view(1, 3, 1, 1, 1)
+DEVICE = "cpu"
 
 
 def timeline(ep: dict, T: int, tb: int) -> tuple[int, int]:
@@ -71,17 +73,18 @@ def analyse(enc, tgt, pred, t: dict, args) -> dict:
     snap[post] = snap[f_pre]
     clips = {"possible": t["possible"], "impossible": t["impossible"], "control": t["control"], "snapshot": snap}
     x = torch.stack([torch.from_numpy(c) for c in clips.values()])
-    x = (x.permute(0, 4, 1, 2, 3).float() / 255 - MEAN) / STD                       # [3, 3, T, H, W]
+    x = ((x.permute(0, 4, 1, 2, 3).float() / 255 - MEAN) / STD).to(DEVICE)           # [4, 3, T, H, W]
     n_ctx, N = ctx // tb * G, T // tb * G
-    ar = lambda a, b: torch.arange(a, b).unsqueeze(0)
+    ar = lambda a, b: torch.arange(a, b, device=DEVICE).unsqueeze(0)
     p = pred(enc(x[:1, :, :ctx]), ar(0, n_ctx), ar(n_ctx, N)).float()[0]           # [Nt, D]
     h = tgt(x).float()
     h = F.layer_norm(h, (h.size(-1),))[:, n_ctx:]                                    # [3, Nt, D]
     S = (T - ctx) // tb
-    err = (p[None] - h).abs().mean(-1).view(len(clips), S, G)[:, first:].mean(1).numpy()  # [4, G] post-reveal
+    err = (p[None] - h).abs().mean(-1).view(len(clips), S, G)[:, first:].mean(1).cpu().numpy()  # [4, G] post-reveal
     rec = {"seed_id": t["seed_id"], "imp_violation": t["imp_meta"]["violation"],
            "ctl_violation": t["ctl_meta"]["violation"], "op": t["meta"]["op"], "n0": int(t["meta"]["n0"]),
-           "final": int(t["meta"]["final"]), "k": int(t["meta"]["k"])}
+           "final": int(t["meta"]["final"]), "k": int(t["meta"]["k"]),
+           "shuffles": int(t["meta"]["shuffles"])}
     for j, k in enumerate(list(clips)[1:], 1):
         M = token_mask(t["possible"][post], clips[k][post], enc.patch, args.thresh, args.min_frac)
         rec[k] = {"mask_tokens": int(M.sum())}
@@ -98,6 +101,11 @@ def summarise(recs: list[dict]) -> dict:
               ("imp=delete", "impossible", lambda r: r["imp_violation"] == "delete"),
               ("ctl=move", "control", lambda r: r["ctl_violation"] == "move"),
               ("ctl=swap", "control", lambda r: r["ctl_violation"] == "swap")]
+    # deletions by whether the claw handled the deleted object's neighbourhood behind the screen:
+    # untouched = only box->hopper removals (the deleted top object sat there since before the screen rose)
+    handled = lambda r: r["op"] == "add" or r["op"] == "none" or r["shuffles"] > 0
+    groups += [("delete,untouched", "impossible", lambda r: r["imp_violation"] == "delete" and not handled(r)),
+               ("delete,handled", "impossible", lambda r: r["imp_violation"] == "delete" and handled(r))]
     for v in ("add", "delete"):
         for op in sorted({r["op"] for r in recs}):
             groups.append((f"imp={v},op={op}", "impossible",
@@ -129,10 +137,13 @@ def main():
     ap.add_argument("--thresh", type=int, default=30, help="per-pixel max-channel diff (0-255) to count as changed")
     ap.add_argument("--min-frac", type=float, default=0.15, help="fraction of a patch's pixels that must change")
     ap.add_argument("--threads", type=int, default=32)
+    ap.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    if torch.cuda.is_available():
-        raise SystemExit("run with CUDA_VISIBLE_DEVICES= : this is a CPU job")
+    global DEVICE
+    DEVICE = a.device
+    if a.device == "cpu" and torch.cuda.is_available():
+        raise SystemExit("--device cpu: run with CUDA_VISIBLE_DEVICES= so nothing touches the GPU")
     torch.set_num_threads(a.threads)
     # one process, held-out set loaded once (~23 GB): several of these at once ran the machine out of memory
     triples = torch.load(a.heldout, weights_only=False)[: a.n]
@@ -143,7 +154,7 @@ def main():
 
 
 def evaluate_one(run: str, weights: str, triples: list[dict], a) -> None:
-    enc, tgt, pred, step = load_run(run, weights, device="cpu")
+    enc, tgt, pred, step = load_run(run, weights, device=DEVICE)
     for m in (enc, tgt, pred):
         m.eval()
     recs = []

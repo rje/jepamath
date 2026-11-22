@@ -12,6 +12,7 @@ Rules (in order):
   heartbeat exit_rc != 0 otherwise                             -> replace (counts as a failure)
   instance not listed / not in a running state                 -> replace (preemption; not a failure)
   started this episode, step unchanged for watch.stall_min     -> replace (failure: a wedged box bills too)
+  no heartbeat at all, episode older than watch.boot_min       -> replace (failure: image pull / boot hung)
   not started, episode older than watch.setup_grace_min        -> replace (failure)
   failures > watch.max_failures                                -> stop
 """
@@ -64,6 +65,8 @@ def decide(o: Obs, job: Job) -> tuple[str, str]:
     if o.ep_step > 0:
         if (o.now - o.t_step) / 60 > w.stall_min:
             return "replace_failure", f"stalled: step {o.ep_step} unchanged for {w.stall_min} min"
+    elif o.hb is None and (o.now - o.ep_start) / 60 > w.boot_min:
+        return "replace_failure", f"no heartbeat {w.boot_min} min after renting (status {o.status}): boot hung"
     elif (o.now - o.ep_start) / 60 > w.setup_grace_min:
         phase = (o.hb or {}).get("phase", "no heartbeat")
         return "replace_failure", f"no progress {w.setup_grace_min} min into the episode (phase {phase})"

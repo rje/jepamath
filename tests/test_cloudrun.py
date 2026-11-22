@@ -198,8 +198,8 @@ def test_stall_after_progress():
 
 
 def test_setup_gets_its_own_longer_clock():
-    assert sup.decide(obs(ep_start=10_000 - 30 * 60), job())[0] == "continue"     # 30 min: past stall, inside grace
-    assert sup.decide(obs(ep_start=10_000 - 41 * 60), job())[0] == "replace_failure"
+    assert sup.decide(obs(ep_start=10_000 - 30 * 60, hb={"phase": "setup", "step": 0}), job())[0] == "continue"     # 30 min: past stall, inside grace
+    assert sup.decide(obs(ep_start=10_000 - 41 * 60, hb={"phase": "setup", "step": 0}), job())[0] == "replace_failure"
 
 
 # ---------- instance env / onstart ----------
@@ -456,3 +456,13 @@ def test_spend_includes_bandwidth(tmp_path):
     assert sup.run(j, p, vast, s3, B2Creds("k", "s", "e"), "c", out=lambda m: None) == "done"
     st = json.loads((tmp_path / "t.json").read_text())
     assert st["episodes"][0]["bandwidth"] == 1.25 and st["spent"] >= 1.25
+
+
+def test_a_box_that_never_boots_is_replaced_after_boot_min():
+    j = job(watch=Watch(boot_min=12, setup_grace_min=40))
+    base = dict(now=0.0, t_start=0.0, ep_start=0.0, status="loading", hb=None, ep_step=0, t_step=0.0,
+                spent=0.0, any_progress=False, failures=0)
+    assert sup.decide(sup.Obs(**{**base, "now": 11 * 60}), j)[0] == "continue"
+    assert sup.decide(sup.Obs(**{**base, "now": 13 * 60}), j)[0] == "replace_failure"
+    booted = {**base, "now": 13 * 60, "hb": {"phase": "data", "step": 0}}
+    assert sup.decide(sup.Obs(**booted), j)[0] == "continue"          # booted: setup_grace applies

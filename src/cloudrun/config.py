@@ -72,6 +72,7 @@ class Budget:
 
 @dc.dataclass(frozen=True)
 class Watch:
+    boot_min: float = 12            # no heartbeat at all (image pull / boot hung) for this long -> replace
     setup_grace_min: float = 45     # no step yet this episode for this long -> replace
     stall_min: float = 20           # step stopped advancing for this long -> replace
     poll_s: float = 60

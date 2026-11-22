@@ -40,11 +40,13 @@ from jepatrain.data import downsample  # noqa: E402
 from jepatrain.reeval import load_run  # noqa: E402
 from locate_surprise import MEAN, STD, token_mask  # noqa: E402
 
-FPS, SETTLE_S = 4.0, 0.5
+FPS, SETTLE_S, LIFT_S = 4.0, 0.5, 1.0   # LIFT_S: after the grasp, the object is clear of the box
 
 
 def cases(data: str, n: int) -> list[dict]:
-    """Clips whose final action is a transfer into the box; with release time, object id and both endings."""
+    """Clips whose final action is a transfer into the box (kind "drop": counterfactual = the dropped object painted
+    out after its release) or out of it into the hopper (kind "pickup": counterfactual = the object painted back
+    into its original spot after the grasp, as if it had stayed). Others are skipped."""
     out = []
     for s in wds.WebDataset(sorted(glob.glob(os.path.join(data, "train", "possible", "*.tar"))), shardshuffle=False,
                             empty_check=False):
@@ -53,20 +55,30 @@ def cases(data: str, n: int) -> list[dict]:
             raise ValueError(f"{ep['episode_id']}: not a visible clip")
         acts = sorted(ep["actions"], key=lambda a: a["t_start"])
         last = acts[-1]
-        if last["kind"] != "transfer" or last["dst"] != "box":
+        if last["kind"] != "transfer" or not (last["dst"] == "box" or (last["src"], last["dst"]) == ("box", "hopper")):
             continue
+        kind = "drop" if last["dst"] == "box" else "pickup"
         rel = [e for e in state["events"] if e["event"] == "release" and last["t_start"] <= e["t"] <= last["t_end"]]
         grasp = [e for e in state["events"] if e["event"] == "grasp" and last["t_start"] <= e["t"] <= last["t_end"]]
         if len(rel) != 1 or len(grasp) != 1:
             raise ValueError(f"{ep['episode_id']}: expected one grasp/release in the last transfer, got {grasp} {rel}")
         oid, t_rel = rel[0]["object_id"], rel[0]["t"]
-        f_rel = math.ceil(t_rel * FPS)                  # first frame after the release
         cf = frames.copy()
-        for f in range(f_rel, len(frames)):
-            m = seg[f] == oid + 1
-            cf[f][m] = frames[0][m]
+        if kind == "drop":
+            for f in range(math.ceil(t_rel * FPS), len(frames)):     # every frame after the release
+                m = seg[f] == oid + 1
+                cf[f][m] = frames[0][m]
+        else:
+            if len([a for a in acts if a["kind"] == "transfer"]) != 1:
+                continue                                              # frame 0 must show the object in place
+            m0 = seg[0] == oid + 1
+            if not m0.any():
+                raise ValueError(f"{ep['episode_id']}: picked object {oid} not visible in frame 0")
+            for f in range(math.ceil(grasp[0]["t"] * FPS), len(frames)):
+                cf[f][m0] = frames[0][m0]
         pos = [np.array(fs["objects"][oid]["pos"]) for fs in state["frames"]]
-        out.append({"id": ep["episode_id"], "op": ep["meta"]["op"], "src": last["src"], "oid": oid, "t_rel": t_rel,
+        out.append({"id": ep["episode_id"], "kind": kind, "t_start": last["t_start"],
+                    "op": ep["meta"]["op"], "src": last["src"], "oid": oid, "t_rel": t_rel,
                     "pos": pos,
                     "t_grasp": grasp[0]["t"], "frames": frames, "cf": cf})
         if len(out) == n:
@@ -77,12 +89,24 @@ def cases(data: str, n: int) -> list[dict]:
 @torch.no_grad()
 def score(enc, tgt, pred, c: dict, cond: str, res: int, device: str) -> dict | None:
     tb, G, T = enc.tubelet, enc.grid * enc.grid, c["frames"].shape[0]
-    settle = math.ceil((c["t_rel"] + SETTLE_S) * FPS)          # first frame with the object at rest
-    if cond in ("held", "frozen"):
+    if c["kind"] == "pickup":
+        # held: context ends before the grasp, with the claw already on its way; after: the object visibly gone
+        if cond == "frozen":
+            return None
+        settle = math.ceil((c["t_grasp"] + LIFT_S) * FPS)
+        if cond == "held":
+            ctx = int(c["t_grasp"] * FPS) // tb * tb
+            if ctx < tb or (ctx - 1) / FPS <= c["t_start"]:
+                return None
+        else:
+            ctx = math.ceil(settle / tb) * tb
+    elif cond in ("held", "frozen"):
+        settle = math.ceil((c["t_rel"] + SETTLE_S) * FPS)      # first frame with the object at rest
         ctx = int(c["t_rel"] * FPS) // tb * tb                 # every context frame is before the release
         if ctx < tb or (ctx - 1) / FPS <= c["t_grasp"]:
             return None                                        # the claw must already hold it in context
     else:
+        settle = math.ceil((c["t_rel"] + SETTLE_S) * FPS)
         ctx = math.ceil(settle / tb) * tb
     first = max(0, math.ceil((settle - ctx) / tb))             # first scored slot: object at rest
     if ctx >= T or ctx + first * tb >= T:
@@ -118,7 +142,7 @@ def score(enc, tgt, pred, c: dict, cond: str, res: int, device: str) -> dict | N
     pv, rv, cv = (z.view(S, G, -1)[first:][:, Mt] for z in (p, h[0], h[1]))
     lam = float(((pv - cv) * (rv - cv)).sum() / ((rv - cv) ** 2).sum())
     # how far (horizontally) the object still was from where it ends up, in the last context frame
-    gap = float(np.linalg.norm(c["pos"][ctx - 1][:2] - c["pos"][-1][:2]))
+    gap = float(np.linalg.norm(c["pos"][ctx - 1][:2] - c["pos"][-1][:2])) if c["kind"] == "drop" else float("nan")
     return {"d_real": float(err[0][M].mean()), "d_cf": float(err[1][M].mean()), "lam": lam, "gap_m": gap,
             "mask_tokens": int(M.sum()), "ctx": ctx}
 
@@ -149,11 +173,13 @@ def main():
             for cond in rows:
                 r = score(enc, tgt, pred, c, cond, res, a.device)
                 if r is not None:
-                    rows[cond].append({"id": c["id"], "src": c["src"], **r})
+                    rows[cond].append({"id": c["id"], "src": c["src"], "kind": c["kind"], **r})
         name = f"{os.path.basename(a.run.rstrip('/'))}_{step:06d}"
         summ = {}
         for cond, rs in rows.items():
-            for lab, f in (("all", lambda r: True), ("from hopper", lambda r: r["src"] == "hopper"),
+            for lab, f in (("all", lambda r: True), ("drop", lambda r: r["kind"] == "drop"),
+                           ("pickup", lambda r: r["kind"] == "pickup"),
+                           ("from hopper", lambda r: r["src"] == "hopper"),
                            ("within box", lambda r: r["src"] == "box"),
                            ("above spot (<2cm)", lambda r: r["gap_m"] < 0.02),
                            ("en route (>=2cm)", lambda r: r["gap_m"] >= 0.02)):

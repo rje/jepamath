@@ -68,6 +68,8 @@ class Template(_Strict):
     control_modes: tuple[Literal["size_matched", "area_matched"], ...] = ("size_matched", "area_matched")
     area_ref_count: int = 5      # area_matched: total area equals this many objects at mid radius
     use_screen: bool = True
+    # height above the box floor the screen hides; None = PILE_H (v2/v3). Large objects need more.
+    pile_h: float | None = None
     # occluded: every transfer behind the raised screen (the twins' setting, v2)
     # visible:  the screen never rises; every transfer in view
     # mixed:    the first transfer in view, then the screen rises for the rest (needs >= 2 transfers;
@@ -244,10 +246,11 @@ def _tray_corners(tr: Tray, top: float) -> np.ndarray:
     return np.array([[cx + sx * hx, cy + sy * hy, z] for sx in (-1, 1) for sy in (-1, 1) for z in (0.0, top)])
 
 
-def _fit_screen(cam: Camera, box: Tray, gap: float, margin: float = 0.02) -> tuple[float, float, float, float]:
+def _fit_screen(cam: Camera, box: Tray, gap: float, pile_h: float = PILE_H,
+                margin: float = 0.02) -> tuple[float, float, float, float]:
     """Screen (center_x, y, yaw, width, height): a vertical panel facing the camera's horizontal
     direction, `gap` in front of the box's outer wall, sized so that every point of the box interior
-    up to PILE_H lies behind it from the camera."""
+    up to pile_h lies behind it from the camera."""
     c = np.asarray(cam.pos)
     b = np.asarray(box.center)
     d = c[:2] - b
@@ -260,7 +263,7 @@ def _fit_screen(cam: Camera, box: Tray, gap: float, margin: float = 0.02) -> tup
     ix, iy = box.inner_size[0] / 2, box.inner_size[1] / 2
     for sx in (-1, 1):
         for sy in (-1, 1):
-            for z in (box.wall_thickness, box.wall_thickness + PILE_H):
+            for z in (box.wall_thickness, box.wall_thickness + pile_h):
                 pt = np.array([b[0] + sx * ix, b[1] + sy * iy, z])
                 lam = float((p0 - c[:2]) @ n) / float((pt[:2] - c[:2]) @ n)
                 q = c + lam * (pt - c)
@@ -323,7 +326,8 @@ def _sample_scene(rng, t: Template) -> tuple[Scene, Physics, dict]:
         cam = Camera(pos=tuple(float(x) for x in pos), lookat=tuple(float(x) for x in look),
                      fovy=float(rng.uniform(*R.cam_fovy_deg)))
 
-        sx, sy, yaw, sw, shh = _fit_screen(cam, box, float(rng.uniform(*R.screen_gap)))
+        sx, sy, yaw, sw, shh = _fit_screen(cam, box, float(rng.uniform(*R.screen_gap)),
+                                           PILE_H if t.pile_h is None else t.pile_h)
         screen = Screen(center_x=sx, y=sy, yaw=yaw, width=sw, height=shh, thickness=0.01,
                         color=_hsv(rng, (0.0, 0.4), (0.4, 0.9)))
         if not _screen_clear_of(screen, hopper):

@@ -16,9 +16,10 @@ local = "heldout"
 
 [machine]
 # small model (17.8M params, ~13 GB at batch 32); the data loader wants CPU cores, the held-out set ~14 GB RAM
-# 5090-class only: ranking assumes equal hours per GPU, so with 4090s listed it would pick the slower card
-gpus = ["RTX 5090", "RTX PRO 6000 S"]
-max_price_per_gpu = 0.55
+# RTX PRO 6000 (Blackwell, 96 GB): ~5090 speed on datacenter-grade hosts. Five 5090 bids in a row were lost
+# within minutes on 21 Nov; Max-Q (300 W) left out as slower
+gpus = ["RTX PRO 6000 S", "RTX PRO 6000 WS"]
+max_price_per_gpu = 0.90
 # Blackwell (5090, PRO 6000) needs a CUDA 12.8 PyTorch build (sm_120) and a host driver that supports it
 image = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime"
 min_cuda = 12.8

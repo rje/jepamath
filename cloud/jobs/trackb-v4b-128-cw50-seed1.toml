@@ -41,7 +41,7 @@ min_ram_gb = 48
 min_inet_down_mbps = 500
 
 [budget]
-max_spend = 3.0
+max_spend = 2.75   # 3 x 2.75 keeps credit >= $73 from $81.80
 max_hours = 3
 
 [watch]

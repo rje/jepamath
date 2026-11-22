@@ -34,6 +34,7 @@ def main():
                 raise KeyError(f"group {key!r} missing from a summary (have {list(s)})")
             v = s[key]
             lam = f" \u03bb {v['lam_mean']:.2f}" if "lam_mean" in v else ""
+            lam += f"/{v['lam_pool']:.2f}" if "lam_pool" in v else ""
             cells.append(f"{v['twin>pos_in']:.0f}%{lam}")
         print(("| " + label + " | " + " | ".join(cells) + " |") if a.md else f"{label:<40}" + "".join(f"{c:>16}" for c in cells))
 

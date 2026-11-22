@@ -53,6 +53,9 @@ def build_heldout(data: str, out: str, n: int, res: int, split: str = "train") -
     """First n twin triples (the same seeds jepaeval's reveal eval uses), at `res` px, clips compressed
     (PackedTriple), saved for reuse. Their seeds are excluded from training."""
     from jepaeval.twins import load_triples
+    if PackedTriple.__module__ != "jepatrain.data":
+        raise RuntimeError(f"PackedTriple would pickle as {PackedTriple.__module__}.PackedTriple; "
+                           "call jepatrain.data.build_heldout from the imported module")
     triples = [PackedTriple(t) for t in load_triples(data, split, n, transform=lambda f: pack(downsample(f, res)))]
     os.makedirs(os.path.dirname(out), exist_ok=True)
     torch.save(triples, out)
@@ -104,7 +107,10 @@ def main():
     ap.add_argument("--n", type=int, default=2000)
     ap.add_argument("--res", type=int, required=True)
     a = ap.parse_args()
-    build_heldout(a.data, a.out, a.n, a.res)
+    # run as `python -m jepatrain.data` this file is __main__; build through the importable module so the
+    # pickle names jepatrain.data.PackedTriple, which any other process can load
+    from jepatrain.data import build_heldout as build
+    build(a.data, a.out, a.n, a.res)
 
 
 if __name__ == "__main__":

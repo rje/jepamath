@@ -1,6 +1,6 @@
 [job]
 name = "trackb-v3-smoke256"
-command = "python -m jepatrain.train --out $RUN_DIR --data $DATA/v3_256 --heldout $DATA/heldout_v3/v3_triples2000_256.pt --res 256 --duty 1.0 --power-ceiling 5000 --workers 12 --auto-resume --steps 400 --warmup 100 --eval-every 400 --ckpt-every 200 --loss l2 --pool-weight 1.0"
+command = "python -m jepatrain.train --out $RUN_DIR --data $DATA/v3_256 --heldout $DATA/heldout_v3_256/v3_triples2000_256.pt --res 256 --duty 1.0 --power-ceiling 5000 --workers 12 --auto-resume --steps 400 --warmup 100 --eval-every 400 --ckpt-every 200 --loss l2 --pool-weight 1.0"
 setup = ["pip install -q webdataset scikit-learn pyarrow pyyaml"]
 progress_regex = '"step": (\d+)'
 rolling = "ckpt_*.pt"
@@ -11,8 +11,8 @@ remote = "data/v3_256"
 local = "v3_256"
 
 [[data]]
-remote = "data/heldout_v3"
-local = "heldout_v3"
+remote = "data/heldout_v3_256"
+local = "heldout_v3_256"
 
 [machine]
 # 256 px, 8 px patches: 8192 tokens/clip (4x v2_128); memory and clips/s are what this smoke measures

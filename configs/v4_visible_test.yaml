@@ -1,0 +1,14 @@
+# Unseen visible-only v4-style clips (seeds outside v4's 0-100k) for the visible placement test.
+visibility_modes: [visible]
+visibility_weights: [1.0]
+count_range: [0, 3]
+final_range: [0, 3]
+k_range: [1, 1]
+radius_range: [0.045, 0.06]
+pile_h: 0.14
+ops: [add, none]
+op_weights: [0.6, 0.4]
+scene:
+  box_inner: [0.28, 0.32]
+  hopper_inner: [0.25, 0.28]
+  cam_distance: [0.85, 1.25]

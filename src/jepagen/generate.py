@@ -83,7 +83,7 @@ def _judge(job: Job, seed: int, eps: list, results: list) -> dict:
 
 # The one simulation failure that is a property of the episode, not a bug: an object knocked out of a tray
 # before the claw comes for it (large objects, v4). The seed is rejected with this reason, like a failed check.
-SIM_REJECT = "claw: no object in region"
+SIM_REJECT = "no object in region"
 
 
 def _sim_rejected(job: Job, seed: int, eps: list, err: Exception) -> dict:

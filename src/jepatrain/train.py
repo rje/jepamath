@@ -248,7 +248,8 @@ def main():
         if step % a.log_every == 0:
             now = time.monotonic()
             rec = {"step": step, "lr": lr_at(step), "clips_per_s": round(a.log_every * B / (now - t_last), 1),
-                   **{k: sum(v) / len(v) for k, v in acc.items()}, "guard": guard.summary()}
+                   **{k: sum(v) / len(v) for k, v in acc.items()}, "guard": guard.summary(),
+                   "max_mem_gb": round(torch.cuda.max_memory_allocated() / 1e9, 1)}
             t_last, acc = now, {}
             logf.write(json.dumps(rec) + "\n"); logf.flush()
             print(f"[train] {json.dumps(rec)}", flush=True)  # every log: cloudrun reads progress from stdout

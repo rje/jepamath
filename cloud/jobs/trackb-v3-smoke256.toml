@@ -1,0 +1,46 @@
+[job]
+name = "trackb-v3-smoke256"
+command = "python -m jepatrain.train --out $RUN_DIR --data $DATA/v3_256 --heldout $DATA/heldout_v3/v3_triples2000_256.pt --res 256 --duty 1.0 --power-ceiling 5000 --workers 12 --auto-resume --steps 400 --warmup 100 --eval-every 400 --ckpt-every 200 --loss l2 --pool-weight 1.0"
+setup = ["pip install -q webdataset scikit-learn pyarrow pyyaml"]
+progress_regex = '"step": (\d+)'
+rolling = "ckpt_*.pt"
+keep_rolling = 2
+
+[[data]]
+remote = "data/v3_256"
+local = "v3_256"
+
+[[data]]
+remote = "data/heldout_v3"
+local = "heldout_v3"
+
+[machine]
+# 256 px, 8 px patches: 8192 tokens/clip (4x v2_128); memory and clips/s are what this smoke measures
+# RTX PRO 6000 (Blackwell, 96 GB): ~5090 speed on datacenter-grade hosts. Five 5090 bids in a row were lost
+# within minutes on 21 Nov; Max-Q (300 W) left out as slower
+gpus = ["RTX PRO 6000 S", "RTX PRO 6000 WS"]
+max_price_per_gpu = 1.00
+# bid high (floor x 2, capped at $1): we pay the bid, and a low bid was preempted within minutes (21-22 Nov)
+bid_multiplier = 2.0
+# Blackwell (5090, PRO 6000) needs a CUDA 12.8 PyTorch build (sm_120) and a host driver that supports it
+image = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime"
+min_cuda = 12.8
+episode_hours = 0.3
+upload_gb = 2.0
+interruptible = true
+min_reliability = 0.98
+min_disk_gb = 80
+min_gpu_ram_gb = 20
+min_cpu_cores = 16
+min_ram_gb = 64
+min_inet_down_mbps = 500
+
+[budget]
+max_spend = 2.0
+max_hours = 1.5
+
+[watch]
+setup_grace_min = 40
+stall_min = 20
+poll_s = 60
+max_failures = 2

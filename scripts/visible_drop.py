@@ -6,6 +6,9 @@ the release (its pixels replaced by the same pixels from the first frame, before
 two clips are identical up to the release, so with the context ending earlier the model makes one prediction for
 both, and the question is which ending it is closer to inside the painted region (the tokens that differ):
 
+  frozen : persistence check. Context as in `held`; the counterfactual is the clip frozen at the last context
+           frame. Over every token that changes (claw, object), lambda ~0 means the model predicts that nothing
+           moves (a copy of what it last saw), ~1 that it predicts the actual motion.
   held   : context ends while the object is still in the claw above the box. Expecting the object means
            predicting the drop: the analogue of a hidden placement, without the occlusion.
   landed : context ends after the object has come to rest in view. Expecting it is just remembering a visible
@@ -75,7 +78,7 @@ def cases(data: str, n: int) -> list[dict]:
 def score(enc, tgt, pred, c: dict, cond: str, res: int, device: str) -> dict | None:
     tb, G, T = enc.tubelet, enc.grid * enc.grid, c["frames"].shape[0]
     settle = math.ceil((c["t_rel"] + SETTLE_S) * FPS)          # first frame with the object at rest
-    if cond == "held":
+    if cond in ("held", "frozen"):
         ctx = int(c["t_rel"] * FPS) // tb * tb                 # every context frame is before the release
         if ctx < tb or (ctx - 1) / FPS <= c["t_grasp"]:
             return None                                        # the claw must already hold it in context
@@ -84,10 +87,16 @@ def score(enc, tgt, pred, c: dict, cond: str, res: int, device: str) -> dict | N
     first = max(0, math.ceil((settle - ctx) / tb))             # first scored slot: object at rest
     if ctx >= T or ctx + first * tb >= T:
         return None
-    fr, cf = downsample(c["frames"], res), downsample(c["cf"], res)
+    if cond == "frozen":
+        first = 0                                              # every predicted slot: the claw moves throughout
+        cfr = c["frames"].copy()
+        cfr[ctx:] = cfr[ctx - 1]
+        fr, cf = downsample(c["frames"], res), downsample(cfr, res)
+    else:
+        fr, cf = downsample(c["frames"], res), downsample(c["cf"], res)
     # held: the two clips share their context, so the one prediction stands for both. landed: the context is the
     # real clip's (the object visibly at rest), which the counterfactual lacks by construction.
-    if cond == "held" and not np.array_equal(fr[:ctx], cf[:ctx]):
+    if cond in ("held", "frozen") and not np.array_equal(fr[:ctx], cf[:ctx]):
         raise ValueError(f"{c['id']}: counterfactual differs inside the context")
     x = torch.stack([torch.from_numpy(fr), torch.from_numpy(cf)])
     x = ((x.permute(0, 4, 1, 2, 3).float() / 255 - MEAN) / STD).to(device)
@@ -135,7 +144,7 @@ def main():
         for m in (enc, tgt, pred):
             m.eval()
         res = json.load(open(os.path.join(a.run, "args.json")))["res"]
-        rows = {cond: [] for cond in ("held", "landed")}
+        rows = {cond: [] for cond in ("frozen", "held", "landed")}
         for c in cs:
             for cond in rows:
                 r = score(enc, tgt, pred, c, cond, res, a.device)

@@ -60,10 +60,15 @@ def analyse(enc, tgt, pred, t: dict, args) -> dict:
     tb, G = enc.tubelet, enc.grid * enc.grid
     T = t["possible"].shape[0]
     ctx, first = timeline(t["pos_episode"], T, tb)
+    # the shared-prediction argument needs the twin's context frames to equal the possible clip's; the generator
+    # only guarantees equality up to the violation time, so a hidden change can leak (e.g. a shadow) before the
+    # reveal. Such twins are excluded and listed in the output, never scored.
+    leaked = {}
     for k in ("impossible", "control"):
-        if not np.array_equal(t["possible"][:ctx], t[k][:ctx]):
-            raise ValueError(f"{t['seed_id']}: {k} context differs from possible; the shared-prediction "
-                             f"argument does not hold")
+        d = np.abs(t["possible"][:ctx].astype(np.int16) - t[k][:ctx].astype(np.int16))
+        if d.any():
+            leaked[k] = {"excluded": "context differs from possible", "max_diff": int(d.max()),
+                         "frame": int(np.nonzero(d.reshape(ctx, -1).max(1))[0][0])}
     post = slice(ctx + first * tb, T)
     raise_t = next(a["t_start"] for a in t["pos_episode"]["actions"] if a["kind"] == "screen_raise")
     f_pre = math.ceil(raise_t * FPS) - 1
@@ -86,6 +91,9 @@ def analyse(enc, tgt, pred, t: dict, args) -> dict:
            "final": int(t["meta"]["final"]), "k": int(t["meta"]["k"]),
            "shuffles": int(t["meta"]["shuffles"])}
     for j, k in enumerate(list(clips)[1:], 1):
+        if k in leaked:
+            rec[k] = leaked[k]
+            continue
         M = token_mask(t["possible"][post], clips[k][post], enc.patch, args.thresh, args.min_frac)
         rec[k] = {"mask_tokens": int(M.sum())}
         if M.sum() == 0:
@@ -118,7 +126,10 @@ def summarise(recs: list[dict]) -> dict:
             continue
         din = np.array([r["d_twin_in"] - r["d_pos_in"] for r in rs])
         dout = np.array([r["d_twin_out"] - r["d_pos_out"] for r in rs])
-        out[name] = {"n": len(rs), "n_empty_mask": sum(1 for r in recs if f(r) and "d_pos_in" not in r[kind]),
+        out[name] = {"n": len(rs),
+                     "n_excluded": sum(1 for r in recs if f(r) and "excluded" in r[kind]),
+                     "n_empty_mask": sum(1 for r in recs if f(r) and "d_pos_in" not in r[kind]
+                                         and "excluded" not in r[kind]),
                      "twin>pos_in": float((din > 0).mean() * 100), "diff_in": float(din.mean()),
                      "sem_in": float(din.std(ddof=1) / math.sqrt(len(din))),
                      "twin>pos_out": float((dout > 0).mean() * 100), "diff_out": float(dout.mean()),
@@ -168,7 +179,7 @@ def evaluate_one(run: str, weights: str, triples: list[dict], a) -> None:
         json.dump({"run": run, "step": step, "args": vars(a), "summary": s, "records": recs}, f)
     print(f"{name}", flush=True)
     for g, v in s.items():
-        print(f"  {g:<22} n={v['n']:4d} (empty {v['n_empty_mask']:3d}) mask {v['mask_tokens']:5.1f} tok | "
+        print(f"  {g:<22} n={v['n']:4d} (empty {v['n_empty_mask']:3d}, excl {v['n_excluded']}) mask {v['mask_tokens']:5.1f} tok | "
               f"twin>pos IN {v['twin>pos_in']:5.1f}% diff {v['diff_in']:+.4f}±{v['sem_in']:.4f} "
               f"| OUT {v['twin>pos_out']:5.1f}% {v['diff_out']:+.4f}", flush=True)
 

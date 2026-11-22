@@ -78,6 +78,24 @@ def sample_masks(rng: random.Random, slots: int, grid: int, p_prefix: float):
     return kind, idx[~tgt], idx[tgt]
 
 
+def change_mask(clips: torch.Tensor, ctx_frames: int, tubelet: int, patch: int, thresh: float) -> torch.Tensor:
+    """Prefix masks: which target tokens show something different from the last context frame.
+
+    clips uint8 [B, T, H, W, 3]; the targets are every token from frame ctx_frames on (slot-major, as the
+    prefix mask orders them). A token is changed when, in any of its tubelet's frames, the patch's mean
+    (over pixels) of the max-channel absolute difference from frame ctx_frames - 1 exceeds `thresh` (0-255).
+    Returns bool [B, n_target_tokens]."""
+    B, T, H, W, _ = clips.shape
+    if ctx_frames % tubelet or not 0 < ctx_frames < T:
+        raise ValueError(f"bad context {ctx_frames} for T={T}, tubelet {tubelet}")
+    x = clips.float()
+    d = (x[:, ctx_frames:] - x[:, ctx_frames - 1:ctx_frames]).abs().amax(-1)       # [B, Tt, H, W]
+    g = H // patch
+    d = d.view(B, -1, g, patch, g, patch).mean((3, 5))                              # [B, Tt, g, g]
+    d = d.view(B, -1, tubelet, g, g).amax(2)                                        # [B, S_t, g, g]
+    return (d > thresh).flatten(1)
+
+
 def per_slot(tgt_idx: torch.Tensor, tokens_per_slot: int) -> int:
     """Number of target tokens in each slot; raises unless every slot that has targets has the same number."""
     counts = torch.bincount(tgt_idx // tokens_per_slot)
@@ -104,6 +122,10 @@ def main():
     ap.add_argument("--loss", choices=("l1", "l2"), default="l1")
     ap.add_argument("--pool-weight", type=float, default=0.0,
                     help="weight of the per-slot pooled (position-free) prediction loss")
+    ap.add_argument("--change-weight", type=float, default=0.0,
+                    help="prefix masks: target tokens that differ from the last context frame weigh 1 + this in the "
+                         "token loss (a dropped object is ~1%% of tokens and otherwise barely moves the loss)")
+    ap.add_argument("--change-thresh", type=float, default=10.0, help="pixel difference (0-255) for 'changed'")
     ap.add_argument("--dim", type=int, default=384)
     ap.add_argument("--depth", type=int, default=8)
     ap.add_argument("--pred-dim", type=int, default=256)
@@ -221,7 +243,15 @@ def main():
                 z = enc(x, keep=ctx)
                 p = pred(z, ctx, tg).float()
                 dist = (lambda d: d.abs()) if a.loss == "l1" else (lambda d: d.pow(2))
-                tok_loss = dist(p - ht).mean()
+                if a.change_weight and kind == "prefix":
+                    ch = change_mask(clips, int(ctx.shape[1]) // enc.tokens_per_slot * enc.tubelet, enc.tubelet,
+                                     enc.patch, a.change_thresh)
+                    w = 1.0 + a.change_weight * ch.float()
+                    tok_loss = (dist(p - ht).mean(-1) * w).sum() / w.sum()
+                    changed_frac = float(ch.float().mean())
+                else:
+                    tok_loss = dist(p - ht).mean()
+                    changed_frac = None
                 loss = tok_loss
                 if a.pool_weight:
                     # target tokens are slot-major with the same count per slot (prefix: whole slots;
@@ -242,6 +272,8 @@ def main():
                 torch._foreach_add_(list(tgt.parameters()), list(enc.parameters()), alpha=1 - m)
         step += 1
         extra = ((f"pool_{kind}", float(pool_loss)),) if a.pool_weight else ()
+        if changed_frac is not None:
+            extra += (("changed_frac", changed_frac),)
         for k, v in ((f"loss_{kind}", float(tok_loss)), *extra, ("gnorm", float(gn)),
                      ("tgt_std", float(h.std(0).mean())), ("pred_std", float(p.std(0).mean()))):
             acc.setdefault(k, []).append(v)

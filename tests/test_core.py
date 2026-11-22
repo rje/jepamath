@@ -191,3 +191,15 @@ def test_encoder_256_tokens():
     e = Encoder(img=256, patch=8, frames=8, tubelet=4, dim=64, depth=1, heads=2)
     assert e.tokens_per_slot == 32 * 32
     assert e(torch.zeros(1, 3, 8, 256, 256)).shape == (1, 2 * 1024, 64)
+
+
+def test_change_mask():
+    import torch
+    from jepatrain.train import change_mask
+    clips = torch.zeros(1, 8, 32, 32, 3, dtype=torch.uint8)
+    clips[0, 6:, 8:16, 16:24] = 200          # a patch-sized object appears in frame 6 at patch (1, 2)
+    m = change_mask(clips, ctx_frames=4, tubelet=4, patch=8, thresh=10)
+    assert m.shape == (1, 16)                # one target slot x 4x4 patches
+    assert m[0].nonzero().flatten().tolist() == [1 * 4 + 2]
+    with pytest.raises(ValueError):
+        change_mask(clips, ctx_frames=3, tubelet=4, patch=8, thresh=10)

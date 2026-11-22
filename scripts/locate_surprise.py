@@ -98,6 +98,11 @@ def analyse(enc, tgt, pred, t: dict, args) -> dict:
         rec[k] = {"mask_tokens": int(M.sum())}
         if M.sum() == 0:
             continue
+        # lambda: where the shared prediction sits on the line from the twin's target (0) to the possible clip's
+        # (1) over the masked tokens of the post-reveal slots (see visible_drop.py for why not just "closer to")
+        Mt = torch.from_numpy(M).to(DEVICE)
+        pv, rv, cv = (z.view(S, G, -1)[first:][:, Mt] for z in (p, h[0], h[j]))
+        rec[k]["lam"] = float(((pv - cv) * (rv - cv)).sum() / ((rv - cv) ** 2).sum())
         rec[k].update(d_pos_in=float(err[0][M].mean()), d_twin_in=float(err[j][M].mean()),
                       d_pos_out=float(err[0][~M].mean()), d_twin_out=float(err[j][~M].mean()))
     return rec
@@ -131,6 +136,8 @@ def summarise(recs: list[dict]) -> dict:
                      "n_empty_mask": sum(1 for r in recs if f(r) and "d_pos_in" not in r[kind]
                                          and "excluded" not in r[kind]),
                      "twin>pos_in": float((din > 0).mean() * 100), "diff_in": float(din.mean()),
+                     "lam_mean": float(np.mean([r["lam"] for r in rs])),
+                     "lam_sem": float(np.std([r["lam"] for r in rs], ddof=1) / math.sqrt(len(rs))),
                      "sem_in": float(din.std(ddof=1) / math.sqrt(len(din))),
                      "twin>pos_out": float((dout > 0).mean() * 100), "diff_out": float(dout.mean()),
                      "d_pos_in": float(np.mean([r["d_pos_in"] for r in rs])),
@@ -180,7 +187,7 @@ def evaluate_one(run: str, weights: str, triples: list[dict], a) -> None:
     print(f"{name}", flush=True)
     for g, v in s.items():
         print(f"  {g:<22} n={v['n']:4d} (empty {v['n_empty_mask']:3d}, excl {v['n_excluded']}) mask {v['mask_tokens']:5.1f} tok | "
-              f"twin>pos IN {v['twin>pos_in']:5.1f}% diff {v['diff_in']:+.4f}±{v['sem_in']:.4f} "
+              f"lambda {v['lam_mean']:+.3f} | twin>pos IN {v['twin>pos_in']:5.1f}% diff {v['diff_in']:+.4f}±{v['sem_in']:.4f} "
               f"| OUT {v['twin>pos_out']:5.1f}% {v['diff_out']:+.4f}", flush=True)
 
 

@@ -33,7 +33,8 @@ def main():
             if key not in s:
                 raise KeyError(f"group {key!r} missing from a summary (have {list(s)})")
             v = s[key]
-            cells.append(f"{v['twin>pos_in']:.0f}% (n={v['n']})")
+            lam = f" \u03bb {v['lam_mean']:.2f}" if "lam_mean" in v else ""
+            cells.append(f"{v['twin>pos_in']:.0f}%{lam}")
         print(("| " + label + " | " + " | ".join(cells) + " |") if a.md else f"{label:<40}" + "".join(f"{c:>16}" for c in cells))
 
 

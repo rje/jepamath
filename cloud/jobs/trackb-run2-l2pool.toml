@@ -24,7 +24,7 @@ max_price_per_gpu = 0.90
 image = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime"
 min_cuda = 12.8
 # rank by expected episode cost: 60 ckpts x 0.27 GB + 13 weights x 0.13 GB synced out per 30k-step run
-episode_hours = 4.0
+episode_hours = 1.0   # 5090 smoke: ~315 clips/s (A5000: 80) -> 30k steps x 32 in ~50 min
 upload_gb = 18.0
 interruptible = true
 min_reliability = 0.98
@@ -36,7 +36,7 @@ min_inet_down_mbps = 500
 
 [budget]
 max_spend = 6.0
-max_hours = 10
+max_hours = 4
 
 [watch]
 setup_grace_min = 40

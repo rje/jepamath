@@ -19,7 +19,9 @@ local = "heldout"
 # RTX PRO 6000 (Blackwell, 96 GB): ~5090 speed on datacenter-grade hosts. Five 5090 bids in a row were lost
 # within minutes on 21 Nov; Max-Q (300 W) left out as slower
 gpus = ["RTX PRO 6000 S", "RTX PRO 6000 WS"]
-max_price_per_gpu = 0.90
+max_price_per_gpu = 1.00
+# bid high (floor x 2, capped at $1): we pay the bid, and a low bid was preempted within minutes (21-22 Nov)
+bid_multiplier = 2.0
 # Blackwell (5090, PRO 6000) needs a CUDA 12.8 PyTorch build (sm_120) and a host driver that supports it
 image = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime"
 min_cuda = 12.8

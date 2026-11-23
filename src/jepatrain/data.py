@@ -63,16 +63,39 @@ def build_heldout(data: str, out: str, n: int, res: int, split: str = "train") -
         json.dump([t["seed_id"] for t in triples], f)
 
 
+def token_seg(seg: np.ndarray, res: int, patch: int, tubelet: int, min_frac: float = 0.125) -> np.ndarray:
+    """Per-token object labels for the mask branch: seg [T, H, W] (0 = background, 1..250 = object id + 1,
+    253/254 = screen/claw) -> uint8 [T // tubelet, G, G], G = res // patch, slot-major like the encoder's tokens.
+    A token's label is the object covering the most of its tubelet volume, if objects cover at least min_frac
+    of it; else 0 (no object)."""
+    T, H, W = seg.shape
+    G = res // patch
+    if H != W or H % G or T % tubelet:
+        raise ValueError(f"seg {seg.shape} does not tile into {T // tubelet} x {G} x {G} tokens")
+    b = H // G
+    blk = seg.reshape(T // tubelet, tubelet, G, b, G, b).transpose(0, 2, 4, 1, 3, 5).reshape(T // tubelet, G, G, -1)
+    obj = (blk >= 1) & (blk <= 250)
+    ids = np.unique(blk[obj])
+    out = np.zeros((T // tubelet, G, G), dtype=np.uint8)
+    if len(ids):
+        counts = np.stack([(blk == k).sum(-1) for k in ids])            # [K, S, G, G]
+        best = counts.argmax(0)
+        enough = obj.sum(-1) >= min_frac * blk.shape[-1]
+        out[enough] = ids[best][enough]
+    return out
+
+
 class PossibleClips(torch.utils.data.IterableDataset):
     """Endless stream of possible clips (uint8 [T, res, res, 3]) from v2 shards, minus held-out seeds.
     Shards are split across workers and reshuffled every pass; a buffer shuffles clips within a worker."""
 
     def __init__(self, data: str, exclude_ids: set[str], res: int, split: str = "train", buffer: int = 256,
-                 seed: int = 0):
+                 seed: int = 0, tokseg: bool = False):
         self.shards = sorted(glob.glob(os.path.join(data, split, "possible", "*.tar")))
         if not self.shards:
             raise FileNotFoundError(f"no possible shards under {data}/{split}")
         self.exclude, self.buffer, self.seed, self.res = exclude_ids, buffer, seed, res
+        self.tokseg = tokseg  # also yield per-token object labels (shards from prep_cloud --tokseg)
 
     def __iter__(self):
         torch.set_num_threads(1)
@@ -92,7 +115,12 @@ class PossibleClips(torch.utils.data.IterableDataset):
                 if s["__key__"] in self.exclude:
                     continue
                 frames = np.load(io.BytesIO(s["clip.npz"]))["frames"]
-                buf.append(torch.from_numpy(downsample(frames, self.res)))
+                clip = torch.from_numpy(downsample(frames, self.res))
+                if self.tokseg:
+                    if "tokseg.npy" not in s:
+                        raise KeyError(f"{s['__key__']}: no tokseg.npy (prepare shards with prep_cloud --tokseg)")
+                    clip = (clip, torch.from_numpy(np.load(io.BytesIO(s["tokseg.npy"]))))
+                buf.append(clip)
                 if len(buf) >= self.buffer:
                     yield buf.pop(rng.randrange(len(buf)))
             if seen == 0:

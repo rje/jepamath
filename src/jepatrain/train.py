@@ -105,6 +105,28 @@ def per_slot(tgt_idx: torch.Tensor, tokens_per_slot: int) -> int:
     return int(counts[0])
 
 
+def supcon(e: torch.Tensor, lab: torch.Tensor, tau: float, k: int, gen: torch.Generator | None = None) -> torch.Tensor:
+    """Mask branch: supervised contrastive loss over each clip's context tokens. e [B, N, d] (unit norm),
+    lab [B, N] object label (0 = no object). Up to k random tokens per clip; anchors are object tokens with
+    another token of the same object among them; every other sampled token is a negative."""
+    B, N, _ = e.shape
+    if N > k:
+        idx = torch.stack([torch.randperm(N, device=e.device, generator=gen)[:k] for _ in range(B)])
+        e = torch.gather(e, 1, idx[..., None].expand(-1, -1, e.shape[-1]))
+        lab = torch.gather(lab, 1, idx)
+    sim = (e @ e.transpose(1, 2)).float() / tau                      # [B, k, k]
+    eye = torch.eye(sim.shape[1], dtype=torch.bool, device=e.device)
+    sim = sim.masked_fill(eye, float("-inf"))
+    logp = sim - torch.logsumexp(sim, -1, keepdim=True)
+    pos = (lab[:, :, None] == lab[:, None, :]) & (lab[:, :, None] > 0) & ~eye
+    n_pos = pos.sum(-1)
+    anchor = n_pos > 0
+    if not anchor.any():
+        raise ValueError("mask branch: no object token with a positive in the batch")
+    per = -(logp.masked_fill(~pos, 0.0)).sum(-1) / n_pos.clamp(min=1)
+    return per[anchor].mean()
+
+
 def main():
     ap = argparse.ArgumentParser(prog="jepatrain")
     ap.add_argument("--data", default="/mnt/data/jepamath/v2")
@@ -126,6 +148,11 @@ def main():
                     help="prefix masks: target tokens that differ from the last context frame weigh 1 + this in the "
                          "token loss (a dropped object is ~1%% of tokens and otherwise barely moves the loss)")
     ap.add_argument("--change-thresh", type=float, default=10.0, help="pixel difference (0-255) for 'changed'")
+    ap.add_argument("--mask-weight", type=float, default=0.0,
+                    help="mask branch: weight of a supervised contrastive loss that groups the encoder's context "
+                         "tokens by rendered object (needs shards from prep_cloud --tokseg). 0 = mask-free")
+    ap.add_argument("--mask-tau", type=float, default=0.1)
+    ap.add_argument("--mask-tokens", type=int, default=384, help="tokens per clip in the contrastive loss")
     ap.add_argument("--dim", type=int, default=384)
     ap.add_argument("--depth", type=int, default=8)
     ap.add_argument("--pred-dim", type=int, default=256)
@@ -156,7 +183,8 @@ def main():
     enc = Encoder(img=a.res, patch=a.patch, dim=a.dim, depth=a.depth, heads=a.dim // 64).to(dev)
     pred = Predictor(enc, dim=a.pred_dim, depth=a.pred_depth, heads=a.pred_dim // 32).to(dev)
     tgt = copy.deepcopy(enc).requires_grad_(False)
-    params = [p for m in (enc, pred) for p in m.parameters()]
+    head = torch.nn.Sequential(torch.nn.Linear(a.dim, a.dim), torch.nn.GELU(), torch.nn.Linear(a.dim, 64)).to(dev)
+    params = [p for m in ((enc, pred, head) if a.mask_weight else (enc, pred)) for p in m.parameters()]
     decay = [p for p in params if p.ndim >= 2]
     no_decay = [p for p in params if p.ndim < 2]
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": a.wd}, {"params": no_decay, "weight_decay": 0}],
@@ -169,6 +197,8 @@ def main():
         ck = torch.load(ck_path, map_location=dev, weights_only=False)
         enc.load_state_dict(ck["enc"]); pred.load_state_dict(ck["pred"]); tgt.load_state_dict(ck["tgt"])
         opt.load_state_dict(ck["opt"]); step = ck["step"]; rng.setstate(ck["rng"])
+        if a.mask_weight:
+            head.load_state_dict(ck["head"])
         print(f"[train] resumed from {ck_path} at step {step}", flush=True)
     with open(os.path.join(a.out, "args.json"), "w") as f:
         json.dump(vars(a), f, indent=1)
@@ -178,7 +208,8 @@ def main():
     # start the loader workers before the held-out set is in memory, so forked workers don't carry it
     with open(a.heldout + ".ids.json") as f:
         exclude = set(json.load(f))
-    loader = torch.utils.data.DataLoader(PossibleClips(a.data, exclude, a.res, seed=a.seed + step), batch_size=a.batch,
+    loader = torch.utils.data.DataLoader(PossibleClips(a.data, exclude, a.res, seed=a.seed + step,
+                                                       tokseg=bool(a.mask_weight)), batch_size=a.batch,
                                          num_workers=a.workers, pin_memory=True, persistent_workers=True,
                                          prefetch_factor=4)
     it = iter(loader)
@@ -203,6 +234,8 @@ def main():
     def save_ckpt():
         state = {"enc": enc.state_dict(), "pred": pred.state_dict(), "tgt": tgt.state_dict(),
                  "opt": opt.state_dict(), "step": step, "rng": rng.getstate()}
+        if a.mask_weight:
+            state["head"] = head.state_dict()
         write_ckpt(a.out, step, state, a.keep_ckpts)
 
     def arm(mult=1.0):
@@ -227,7 +260,14 @@ def main():
     enc.train(); pred.train()
     while step < a.steps:
         arm()
-        clips = next(it).to(dev, non_blocking=True)
+        batch = next(it)
+        if a.mask_weight:
+            clips, tokseg = batch[0].to(dev, non_blocking=True), batch[1].to(dev, non_blocking=True)
+            if tuple(tokseg.shape[1:]) != (enc.slots, enc.grid, enc.grid):
+                raise ValueError(f"tokseg {tuple(tokseg.shape)} does not match the encoder's tokens "
+                                 f"({enc.slots}, {enc.grid}, {enc.grid})")
+        else:
+            clips = batch.to(dev, non_blocking=True)
         kind, ctx, tg = sample_masks(rng, enc.slots, enc.grid, a.p_prefix)
         B = clips.shape[0]
         ctx, tg = ctx.to(dev).unsqueeze(0).expand(B, -1), tg.to(dev).unsqueeze(0).expand(B, -1)
@@ -260,6 +300,11 @@ def main():
                     pp, hp = (v.view(B, S_t, -1, v.shape[-1]).mean(2) for v in (p, ht))
                     pool_loss = dist(pp - hp).mean()
                     loss = tok_loss + a.pool_weight * pool_loss
+                if a.mask_weight:
+                    lab = torch.gather(tokseg.flatten(1).long(), 1, ctx)
+                    e = F.normalize(head(z.float()), dim=-1)
+                    mask_loss = supcon(e, lab, a.mask_tau, a.mask_tokens)
+                    loss = loss + a.mask_weight * mask_loss
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite loss at step {step}")
             opt.zero_grad(set_to_none=True)
@@ -274,6 +319,8 @@ def main():
         extra = ((f"pool_{kind}", float(pool_loss)),) if a.pool_weight else ()
         if changed_frac is not None:
             extra += (("changed_frac", changed_frac),)
+        if a.mask_weight:
+            extra += (("mask_loss", float(mask_loss)),)
         for k, v in ((f"loss_{kind}", float(tok_loss)), *extra, ("gnorm", float(gn)),
                      ("tgt_std", float(h.std(0).mean())), ("pred_std", float(p.std(0).mean()))):
             acc.setdefault(k, []).append(v)

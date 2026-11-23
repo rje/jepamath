@@ -203,3 +203,30 @@ def test_change_mask():
     assert m[0].nonzero().flatten().tolist() == [1 * 4 + 2]
     with pytest.raises(ValueError):
         change_mask(clips, ctx_frames=3, tubelet=4, patch=8, thresh=10)
+
+
+def test_token_seg():
+    import numpy as np
+    from jepatrain.data import token_seg
+    seg = np.zeros((8, 32, 32), np.uint8)
+    seg[:4, 0:8, 0:8] = 3          # object 2 fills token (0, 0, 0) in slot 0 only
+    seg[:, 8:9, 8:16] = 5          # a sliver: 1/8 of a token's rows -> exactly min_frac -> labelled
+    seg[:, 16:24, 16:24] = 254     # claw is not an object
+    ts = token_seg(seg, 16, 4, 4)  # G = 4, block 8 px, 2 slots
+    assert ts.shape == (2, 4, 4)
+    assert ts[0, 0, 0] == 3 and ts[1, 0, 0] == 0
+    assert ts[0, 1, 1] == 5 and ts[0, 2, 2] == 0
+
+
+def test_supcon_prefers_grouped_embeddings():
+    import torch
+    import torch.nn.functional as F
+    from jepatrain.train import supcon
+    torch.manual_seed(0)
+    lab = torch.tensor([[1, 1, 1, 2, 2, 2, 0, 0]])
+    centers = F.normalize(torch.randn(3, 16), dim=-1)
+    grouped = F.normalize(centers[lab] + 0.05 * torch.randn(1, 8, 16), dim=-1)
+    rand = F.normalize(torch.randn(1, 8, 16), dim=-1)
+    assert supcon(grouped, lab, 0.1, 64) < supcon(rand, lab, 0.1, 64)
+    with pytest.raises(ValueError, match="no object token"):
+        supcon(rand, torch.zeros(1, 8, dtype=torch.long), 0.1, 64)

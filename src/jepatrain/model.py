@@ -12,6 +12,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+FAST_SDPA = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
 
 
 def sincos_3d(t: int, h: int, w: int, dim: int) -> torch.Tensor:
@@ -45,7 +48,14 @@ class Block(nn.Module):
     def forward(self, x):
         B, N, D = x.shape
         q, k, v = self.qkv(self.n1(x)).view(B, N, 3, self.heads, D // self.heads).permute(2, 0, 3, 1, 4)
-        a = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, N, D)
+        if q.is_cuda:
+            # fast kernels only: the math fallback is ~27x slower at 8k tokens (measured on the RTX 6000 Ada), and
+            # silently landing on it would waste a run; with neither fast kernel available this raises instead
+            with sdpa_kernel(FAST_SDPA):
+                a = F.scaled_dot_product_attention(q, k, v)
+        else:
+            a = F.scaled_dot_product_attention(q, k, v)
+        a = a.transpose(1, 2).reshape(B, N, D)
         x = x + self.proj(a)
         return x + self.mlp(self.n2(x))
 

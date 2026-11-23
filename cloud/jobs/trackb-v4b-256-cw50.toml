@@ -1,0 +1,51 @@
+[job]
+name = "trackb-v4b-256-cw50"
+command = "python -m jepatrain.train --out $RUN_DIR --data $DATA/v4b_256 --heldout $DATA/heldout_v4b_256/v4b_triples2000_256.pt --res 256 --duty 1.0 --power-ceiling 5000 --workers 12 --auto-resume --loss l2 --pool-weight 1.0 --change-weight 50 && python scripts/locate_surprise.py $RUN_DIR --weights weights_015000.pt weights_030000.pt --heldout $DATA/heldout_v4b_256/v4b_triples2000_256.pt --out $RUN_DIR/locate --device cuda && python scripts/visible_drop.py $RUN_DIR --weights weights_015000.pt weights_030000.pt --data $DATA/v4_vistest --n 400 --out $RUN_DIR/visdrop --device cuda"
+setup = ["pip install -q webdataset scikit-learn pyarrow pyyaml pydantic"]
+progress_regex = '"step": (\d+)'
+rolling = "ckpt_*.pt"
+keep_rolling = 2
+
+[[data]]
+remote = "data/v4b_256"
+local = "v4b_256"
+
+[[data]]
+remote = "data/heldout_v4b_256"
+local = "heldout_v4b_256"
+
+[[data]]
+remote = "data/v4_vistest"
+local = "v4_vistest"
+
+[machine]
+# 256 px, 8 px patches: 8192 tokens/clip (4x 128 px); ~40 GB GPU at batch 32; the held-out set is large in RAM
+# RTX PRO 6000 (Blackwell, 96 GB): ~5090 speed on datacenter-grade hosts. Five 5090 bids in a row were lost
+# within minutes on 21 Nov; Max-Q (300 W) left out as slower
+gpus = ["RTX PRO 6000 S", "RTX PRO 6000 WS"]
+max_price_per_gpu = 1.00
+# bid high (floor x 2, capped at $1): we pay the bid, and a low bid was preempted within minutes (21-22 Nov)
+bid_multiplier = 2.0
+# Blackwell (5090, PRO 6000) needs a CUDA 12.8 PyTorch build (sm_120) and a host driver that supports it
+image = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime"
+min_cuda = 12.8
+# rank by expected episode cost: ckpts + weights synced out over a ~4.5 h run
+episode_hours = 2.0   # 65 clips/s at 256 px (GPU-bound) -> 30k steps in ~4.5 h + evals
+upload_gb = 20.0
+interruptible = true
+min_reliability = 0.98
+min_disk_gb = 80
+min_gpu_ram_gb = 20
+min_cpu_cores = 16
+min_ram_gb = 64
+min_inet_down_mbps = 500
+
+[budget]
+max_spend = 8.0
+max_hours = 7
+
+[watch]
+setup_grace_min = 40
+stall_min = 20
+poll_s = 60
+max_failures = 2

@@ -12,7 +12,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION = "0.2"
+SPEC_VERSION = "0.3"  # 0.3: glides
 
 Vec2 = tuple[float, float]
 Vec3 = tuple[float, float, float]
@@ -122,6 +122,17 @@ class Transfer(_Strict):
 Action = ScreenMove | Transfer
 
 
+class Glide(_Strict):
+    """Object `object_id` moves on its own across its tray floor to `to_xy` over [t_start, t_end]
+    (smoothstep path from wherever it is at t_start). Spheres roll, other shapes slide upright.
+    Not during a transfer or while the screen is up or moving (the twins must stay identical)."""
+
+    object_id: int
+    t_start: float
+    t_end: float
+    to_xy: Vec2
+
+
 ViolationKind = Literal["add", "delete", "move", "swap"]
 COUNT_CHANGING = ("add", "delete")   # impossible twins
 COUNT_PRESERVING = ("move", "swap")  # control twins: an unexplained hidden change, same count
@@ -176,6 +187,7 @@ class Episode(_Strict):
     scene: Scene
     objects: list[ObjectSpec]
     actions: list[Action]
+    glides: list[Glide] = []
     violation: Violation | None = None
     twin_of: str | None = None
     clip: Clip
@@ -194,6 +206,23 @@ class Episode(_Strict):
         for a in acts:
             if a.t_end <= a.t_start or a.t_end > self.clip.duration:
                 raise ValueError(f"action outside clip or empty: {a}")
+        busy = [(a.t_start, a.t_end) for a in acts if isinstance(a, Transfer)]
+        screen = [a for a in acts if isinstance(a, ScreenMove)]
+        if screen:
+            busy.append((screen[0].t_start, max(a.t_end for a in screen)))
+        by_obj: dict[int, list[Glide]] = {}
+        for g in self.glides:
+            if g.t_end <= g.t_start or g.t_end > self.clip.duration:
+                raise ValueError(f"glide outside clip or empty: {g}")
+            if g.object_id not in ids or next(o for o in self.objects if o.id == g.object_id).start_region == "reserve":
+                raise ValueError(f"glide of a missing or reserve object: {g}")
+            if any(g.t_start < b and a < g.t_end for a, b in busy):
+                raise ValueError(f"glide overlaps a transfer or the screen's raised period: {g}")
+            by_obj.setdefault(g.object_id, []).append(g)
+        for gs in by_obj.values():
+            gs = sorted(gs, key=lambda g: g.t_start)
+            if any(b.t_start < a.t_end for a, b in zip(gs, gs[1:])):
+                raise ValueError(f"overlapping glides of one object: {gs}")
         if self.violation is not None:
             v = self.violation
             if not self.box_occluded_at(v.t):

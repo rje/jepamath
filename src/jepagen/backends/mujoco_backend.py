@@ -104,6 +104,8 @@ class MujocoBackend:
     def __init__(self, episode: Episode, limiter):
         if len(episode.objects) > MAX_OBJECTS:
             raise ValueError("too many objects")
+        if episode.glides:
+            raise NotImplementedError("glides are Rust-engine only")
         self.ep = episode
         self.limiter = limiter
         self.m = mujoco.MjModel.from_xml_string(build_mjcf(episode))

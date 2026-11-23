@@ -16,6 +16,9 @@ REST_ANG_SPEED = 1.0            # rad/s, final frame
 MIN_VISIBLE_PX_128 = 6          # every non-reserve object visible at first and last frame (px at 128x128)
 
 
+MAX_GLIDE_RISE_M = 0.015  # an object pushed up onto another (or a wall) is not "moving on its own"
+
+
 def min_visible_px(width: int, height: int) -> int:
     """MIN_VISIBLE_PX_128 scaled by frame area, so the check means the same at any resolution.
     A twin's hidden change must also differ by at least this many seg pixels at the end."""
@@ -63,6 +66,20 @@ def validate_clip(clip: ClipResult, diag: dict) -> Validation:
         if s.count_per_region["table"]:
             reasons.append(f"object escaped to table at t={s.t:.2f}")
             break
+    # glides: objects move on their own within their tray; nobody changes tray or climbs over another
+    if ep.glides:
+        g_end = max(g.t_end for g in ep.glides)
+        for s in st:
+            if s.t > g_end + 0.5:
+                break
+            c = s.count_per_region
+            if (c["box"], c["hopper"]) != (meta["n0"], meta["n_hopper"]):
+                reasons.append(f"glide phase changed tray counts at t={s.t:.2f}: box {c['box']} hopper {c['hopper']}")
+                break
+        z0 = {o["id"]: o["pos"][2] for o in st[0].objects}
+        rise = max((o["pos"][2] - z0[o["id"]] for s in st if s.t <= g_end + 0.5 for o in s.objects), default=0.0)
+        if rise > MAX_GLIDE_RISE_M:
+            reasons.append(f"glide lifted an object {rise * 100:.1f} cm")
     exp_reserve_end = len(reserve_ids) + {None: 0, "add": -1, "delete": 1, "move": 0, "swap": 0}[v.kind if v else None]
     if last["reserve"] != exp_reserve_end:
         reasons.append(f"reserve count {last['reserve']} != {exp_reserve_end}")

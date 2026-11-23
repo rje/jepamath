@@ -30,15 +30,16 @@ def preview(template: Template, manifest: Manifest, split: str, seeds, out_dir: 
         v = validate_clip(clip, diag)
         panels = [_label(clip.frames, (40, 200, 40))]
         status = f"possible: {'ok' if v.ok else '; '.join(v.reasons)}"
-        kinds = (["impossible"] + (["control"] if can_control(ep) and backend == "rust" else [])) if template.use_screen else []
+        twinable = template.use_screen and ep.meta["visibility"] == "occluded"
+        kinds = (["impossible"] + (["control"] if can_control(ep) and backend == "rust" else [])) if twinable else []
         for kind in kinds:
             tw = make_twin(ep, seed, kind)
             tclip, tdiag = run_episode(tw, backend, lim)
             tv, pv = validate_clip(tclip, tdiag), validate_twins(clip, tclip)
             panels.append(_label(tclip.frames, (220, 40, 40) if kind == "impossible" else (230, 170, 30)))
             status += f" | {kind} ({tw.violation.kind}): {'ok' if tv.ok and pv.ok else '; '.join(tv.reasons + pv.reasons)}"
-        if len(kinds) == 1 and template.use_screen and backend == "rust":
-            panels.append(np.zeros_like(panels[0]))  # empty box at the end: no control twin; keep widths equal
+        if template.use_screen and backend == "rust" and len(kinds) < 2:
+            panels += [np.zeros_like(panels[0])] * (2 - len(kinds))  # no control twin / no twins: keep widths equal
         frames = np.concatenate(panels, axis=2)
         frames = np.repeat(np.repeat(frames, scale, 1), scale, 2)
         m = ep.meta

@@ -124,6 +124,77 @@ impl Mechanic for ScreenMechanic {
     }
 }
 
+/// Steers objects along their glides: each step, the xy velocity takes the object to its point on a
+/// smoothstep path from where it was at t_start to `to_xy`. z stays physical (gravity, contacts).
+/// Spheres get the matching rolling spin; other shapes are kept from spinning or tipping while steered.
+pub struct GlideMechanic {
+    /// per glide: xy where the object was when the glide began (None until then); finished flag
+    start: Vec<Option<[f64; 2]>>,
+    done: Vec<bool>,
+    events: Vec<Event>,
+}
+
+/// Steering speed limit (m/s). A blocked object cannot be driven through a wall or a pile.
+pub const GLIDE_VMAX: f64 = 0.6;
+
+impl GlideMechanic {
+    pub fn new(ep: &Episode) -> Self {
+        let n = ep.glides.len();
+        GlideMechanic { start: vec![None; n], done: vec![false; n], events: vec![] }
+    }
+}
+
+impl Mechanic for GlideMechanic {
+    fn name(&self) -> &'static str {
+        "glide"
+    }
+    fn pre_step(&mut self, ep: &Episode, t: f64, w: &mut Physics) -> Result<(), String> {
+        let dt = ep.physics.timestep;
+        for (i, g) in ep.glides.iter().enumerate() {
+            if self.done[i] || t <= g.t_start {
+                continue;
+            }
+            let oid = g.object_id;
+            if w.grip.map(|h| h.0) == Some(oid) {
+                return Err(format!("glide of object {oid} while the claw holds it"));
+            }
+            let h = w.objects[oid];
+            let cur = w.pw.bodies[h].translation();
+            let start = *self.start[i].get_or_insert_with(|| {
+                self.events.push(Event { t: g.t_start, event: "glide_start".into(), object_id: oid });
+                [cur.x as f64, cur.y as f64]
+            });
+            let b = &mut w.pw.bodies[h];
+            let vz = b.linvel().z;
+            if t >= g.t_end {
+                b.set_linvel(Vec3::new(0.0, 0.0, vz), true);
+                b.set_angvel(Vec3::ZERO, true);
+                self.done[i] = true;
+                self.events.push(Event { t: g.t_end, event: "glide_end".into(), object_id: oid });
+                continue;
+            }
+            let s = rules::smoothstep(((t - g.t_start) / (g.t_end - g.t_start)).clamp(0.0, 1.0));
+            let want = [start[0] + (g.to_xy[0] - start[0]) * s, start[1] + (g.to_xy[1] - start[1]) * s];
+            let mut v = [(want[0] - cur.x as f64) / dt, (want[1] - cur.y as f64) / dt];
+            let sp = (v[0] * v[0] + v[1] * v[1]).sqrt();
+            if sp > GLIDE_VMAX {
+                v = [v[0] * GLIDE_VMAX / sp, v[1] * GLIDE_VMAX / sp];
+            }
+            b.set_linvel(Vec3::new(v[0] as f32, v[1] as f32, vz), true);
+            let o = &ep.objects[oid];
+            let av = match o.shape {
+                Shape::Sphere => Vec3::new((-v[1] / o.size[0]) as f32, (v[0] / o.size[0]) as f32, 0.0),
+                _ => Vec3::ZERO,
+            };
+            b.set_angvel(av, true);
+        }
+        Ok(())
+    }
+    fn events(&self) -> Vec<Event> {
+        self.events.clone()
+    }
+}
+
 pub const FRICTION: f32 = 0.9;
 /// rapier has no rolling friction; angular damping stands in for it so spheres come to rest.
 pub const ANGULAR_DAMPING: f32 = 2.0;
@@ -231,7 +302,8 @@ impl World {
 
         let phys = Physics { pw, objects, claw, screen, grip: None };
         let mechanics: Vec<Box<dyn Mechanic>> =
-            vec![Box::new(ScreenMechanic), Box::new(ClawMechanic { ctl: ClawController::new(&ep) })];
+            vec![Box::new(ScreenMechanic), Box::new(ClawMechanic { ctl: ClawController::new(&ep) }),
+                 Box::new(GlideMechanic::new(&ep))];
         let mut w = World { ep, phys, mechanics, t: 0.0, events: vec![] };
 
         // preroll: settle with everything parked, unrendered

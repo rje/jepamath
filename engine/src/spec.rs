@@ -114,6 +114,16 @@ impl Action {
     }
 }
 
+/// An object steers itself across its tray floor to `to_xy` over [t_start, t_end] ("moves on its own").
+/// Spheres roll; boxes and cylinders slide upright. Collisions with other objects are physical.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Glide {
+    pub object_id: usize,
+    pub t_start: f64,
+    pub t_end: f64,
+    pub to_xy: V2,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Violation {
     pub kind: String, // "add" | "delete" | "move" | "swap"
@@ -149,6 +159,7 @@ pub struct Episode {
     pub scene: Scene,
     pub objects: Vec<ObjectSpec>,
     pub actions: Vec<Action>,
+    pub glides: Vec<Glide>,
     pub violation: Option<Violation>,
     pub twin_of: Option<String>,
     pub clip: Clip,
@@ -156,7 +167,7 @@ pub struct Episode {
     pub meta: serde_json::Value,
 }
 
-pub const SUPPORTED_SPEC_VERSION: &str = "0.2";
+pub const SUPPORTED_SPEC_VERSION: &str = "0.3";
 
 impl Episode {
     pub fn from_json(s: &str) -> Result<Self, String> {
@@ -178,6 +189,14 @@ impl Episode {
             };
             if o.size.len() != n {
                 return Err(format!("object {} size has {} values, expected {}", o.id, o.size.len(), n));
+            }
+        }
+        for g in &ep.glides {
+            if g.object_id >= ep.objects.len() {
+                return Err(format!("glide of unknown object {}", g.object_id));
+            }
+            if g.t_end <= g.t_start {
+                return Err(format!("empty glide {g:?}"));
             }
         }
         Ok(ep)

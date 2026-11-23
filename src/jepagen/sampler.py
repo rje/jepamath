@@ -11,11 +11,11 @@ import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from .spec import (
-    Camera, Clip, Episode, Light, ObjectSpec, Physics, Scene, Screen, ScreenMove, Transfer, Tray,
+    Camera, Clip, Episode, Glide, Light, ObjectSpec, Physics, Scene, Screen, ScreenMove, Transfer, Tray,
     Violation,
 )
 
-SAMPLER_VERSION = "v3"
+SAMPLER_VERSION = "v4"  # v4: optional glide phase
 RESERVE_Z = -3.0  # must match backends.base.RESERVE_Z
 CLAW_PAD_HALF_Z = 0.006  # must match backends.base.CLAW_PAD_HALF[2]
 PILE_H = 0.09     # height above the box floor the screen must hide (validator catches taller piles)
@@ -76,6 +76,11 @@ class Template(_Strict):
     #           episodes with one transfer draw from the other modes)
     visibility_modes: tuple[Literal["occluded", "visible", "mixed"], ...] = ("occluded",)
     visibility_weights: tuple[float, ...] = (1.0,)
+    # glide phase (v5, stage 0 individuation): before the first action, objects in view move on their own
+    # to random points in their tray (common fate), several at once. (0, 0) = none (no rng draws).
+    glide_phase_s: tuple[float, float] = (0.0, 0.0)
+    glide_prob: float = 0.8           # per object in the box or hopper
+    glide_s: tuple[float, float] = (0.7, 1.5)
     transfer_s: tuple[float, float] = (1.6, 2.0)
     screen_move_s: tuple[float, float] = (0.3, 0.5)
     clip: Clip = Clip(n_frames=32, fps=4, width=256, height=256)
@@ -95,7 +100,9 @@ class Template(_Strict):
         if self.k_range[1] > self.max_transfers:
             raise ValueError("k_range exceeds max_transfers")
         sm = self.screen_move_s[1]
-        worst = 0.9 + sm + 0.4 + self.max_transfers * (self.transfer_s[1] + 0.1) + 0.7 + sm + 0.6
+        if self.glide_phase_s[0] > self.glide_phase_s[1] or (self.glide_phase_s[1] > 0 and self.glide_s[0] > self.glide_phase_s[0]):
+            raise ValueError("glide_phase_s must be ordered and at least as long as the shortest glide")
+        worst = self.glide_phase_s[1] + 0.9 + sm + 0.4 + self.max_transfers * (self.transfer_s[1] + 0.1) + 0.7 + sm + 0.6
         if self.use_screen and worst > self.clip.duration:
             raise ValueError(f"clip of {self.clip.duration}s cannot hold worst-case timeline {worst:.2f}s")
         return self
@@ -472,7 +479,8 @@ def sample_episode(t: Template, man: Manifest, split: str, seed: int) -> Episode
         return tt + sm + float(rng.uniform(0.1, 0.4))
 
     actions = []
-    tt = float(rng.uniform(0.4, 0.9))
+    g_phase = float(rng.uniform(*t.glide_phase_s)) if t.glide_phase_s[1] > 0 else 0.0
+    tt = g_phase + float(rng.uniform(0.4, 0.9))
     if vis == "occluded":
         tt = raise_screen(tt)
     for i_m, m_ in enumerate(order):
@@ -494,12 +502,36 @@ def sample_episode(t: Template, man: Manifest, split: str, seed: int) -> Episode
     if tt + 0.6 > t.clip.duration:
         raise RuntimeError(f"timeline {tt:.2f}s overruns clip {t.clip.duration}s")
 
+    glides = []
+    if g_phase > 0:
+        movers = [o for o in objects if o.start_region != "reserve"]
+        chosen = [o for o in movers if rng.uniform() < t.glide_prob]
+        if movers and not chosen:
+            chosen = [movers[int(rng.integers(len(movers)))]]
+        for o in chosen:
+            tray = box if o.start_region == "box" else hopper
+            d = min(float(rng.uniform(*t.glide_s)), g_phase)
+            t0 = float(rng.uniform(0.2, 0.2 + g_phase - d))
+            m = radii[o.id] + 0.012
+            hx, hy = tray.inner_size[0] / 2 - m, tray.inner_size[1] / 2 - m
+            # a target clear of every other object's start spot and of the targets already chosen
+            others = [(p.start_pos[0], p.start_pos[1], radii[p.id]) for p in movers if p.id != o.id]
+            others += [(g.to_xy[0], g.to_xy[1], radii[g.object_id]) for g in glides]
+            for _ in range(200):
+                to = (float(tray.center[0] + rng.uniform(-hx, hx)), float(tray.center[1] + rng.uniform(-hy, hy)))
+                if all(math.hypot(to[0] - x, to[1] - y) > radii[o.id] + r + 0.015 for x, y, r in others):
+                    break
+            else:
+                continue  # crowded tray: this object stays put
+            glides.append(Glide(object_id=o.id, t_start=t0, t_end=t0 + d, to_xy=to))
+
     return Episode(
         episode_id=f"{split}-{seed:09d}", seed=seed, episode_type="transfer", split=split, scene=scene,
-        objects=objects, actions=actions, clip=t.clip, physics=physics,
+        objects=objects, actions=actions, glides=glides, clip=t.clip, physics=physics,
         meta={"sampler": SAMPLER_VERSION, "n0": n0, "op": op, "k": k, "final": final, "shuffles": n_shuf,
               "visibility": vis, "control_mode": mode, "base_radius": base_r, "palette": palette, "shapes": ep_shapes,
-              "n_hopper": n_hopper, "last_transfer_end": last_transfer_end, "scene": scene_params},
+              "n_hopper": n_hopper, "last_transfer_end": last_transfer_end,
+              "glide_phase": g_phase, "n_glides": len(glides), "scene": scene_params},
     )
 
 

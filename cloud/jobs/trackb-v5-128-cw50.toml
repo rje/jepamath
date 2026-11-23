@@ -1,0 +1,52 @@
+# v5 (glide phase: objects move on their own) vs trackb-v4b-128-cw50-only: training data is the only change; evals on the v4b held-out sets
+[job]
+name = "trackb-v5-128-cw50"
+command = "python -m jepatrain.train --out $RUN_DIR --data $DATA/v5_128 --heldout $DATA/heldout_v4b_128/v4b_triples2000_128.pt --res 128 --duty 1.0 --power-ceiling 5000 --workers 12 --auto-resume --loss l2 --pool-weight 1.0 --change-weight 50 --p-prefix 0.5 && python scripts/locate_surprise.py $RUN_DIR --weights weights_015000.pt weights_030000.pt --heldout $DATA/heldout_v4b_128/v4b_triples2000_128.pt --out $RUN_DIR/locate --device cuda && python scripts/visible_drop.py $RUN_DIR --weights weights_015000.pt weights_030000.pt --data $DATA/v4_vistest --n 400 --out $RUN_DIR/visdrop --device cuda"
+setup = ["pip install -q webdataset scikit-learn pyarrow pyyaml pydantic"]
+progress_regex = '"step": (\d+)'
+rolling = "ckpt_*.pt"
+keep_rolling = 2
+
+[[data]]
+remote = "data/v5_128"
+local = "v5_128"
+
+[[data]]
+remote = "data/heldout_v4b_128"
+local = "heldout_v4b_128"
+
+[[data]]
+remote = "data/v4_vistest"
+local = "v4_vistest"
+
+[machine]
+# small model (17.8M params, ~13 GB at batch 32); the data loader wants CPU cores, the held-out set ~14 GB RAM
+# RTX PRO 6000 (Blackwell, 96 GB): ~5090 speed on datacenter-grade hosts. Five 5090 bids in a row were lost
+# within minutes on 21 Nov; Max-Q (300 W) left out as slower
+gpus = ["RTX PRO 6000 S", "RTX PRO 6000 WS"]
+max_price_per_gpu = 1.00
+# bid high (floor x 2, capped at $1): we pay the bid, and a low bid was preempted within minutes (21-22 Nov)
+bid_multiplier = 2.0
+# Blackwell (5090, PRO 6000) needs a CUDA 12.8 PyTorch build (sm_120) and a host driver that supports it
+image = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime"
+min_cuda = 12.8
+# rank by expected episode cost: 60 ckpts x 0.27 GB + 13 weights x 0.13 GB synced out per 30k-step run
+episode_hours = 1.0   # 30k steps at ~370 clips/s: ~45 min + evals
+upload_gb = 18.0
+interruptible = true
+min_reliability = 0.98
+min_disk_gb = 80
+min_gpu_ram_gb = 20
+min_cpu_cores = 16
+min_ram_gb = 48
+min_inet_down_mbps = 500
+
+[budget]
+max_spend = 3.0
+max_hours = 3
+
+[watch]
+setup_grace_min = 40
+stall_min = 20
+poll_s = 60
+max_failures = 2

@@ -105,10 +105,13 @@ def per_slot(tgt_idx: torch.Tensor, tokens_per_slot: int) -> int:
     return int(counts[0])
 
 
-def supcon(e: torch.Tensor, lab: torch.Tensor, tau: float, k: int, gen: torch.Generator | None = None) -> torch.Tensor:
+def supcon(e: torch.Tensor, lab: torch.Tensor, tau: float, k: int,
+           gen: torch.Generator | None = None) -> torch.Tensor | None:
     """Mask branch: supervised contrastive loss over each clip's context tokens. e [B, N, d] (unit norm),
     lab [B, N] object label (0 = no object). Up to k random tokens per clip; anchors are object tokens with
-    another token of the same object among them; every other sampled token is a negative."""
+    another token of the same object among them; every other sampled token is a negative.
+    None when no token qualifies as an anchor: a long tube mask can leave only background cells as context
+    (the mask is shared by the batch), and then there is nothing to group."""
     B, N, _ = e.shape
     if N > k:
         idx = torch.stack([torch.randperm(N, device=e.device, generator=gen)[:k] for _ in range(B)])
@@ -122,7 +125,7 @@ def supcon(e: torch.Tensor, lab: torch.Tensor, tau: float, k: int, gen: torch.Ge
     n_pos = pos.sum(-1)
     anchor = n_pos > 0
     if not anchor.any():
-        raise ValueError("mask branch: no object token with a positive in the batch")
+        return None
     per = -(logp.masked_fill(~pos, 0.0)).sum(-1) / n_pos.clamp(min=1)
     return per[anchor].mean()
 
@@ -304,7 +307,8 @@ def main():
                     lab = torch.gather(tokseg.flatten(1).long(), 1, ctx)
                     e = F.normalize(head(z.float()), dim=-1)
                     mask_loss = supcon(e, lab, a.mask_tau, a.mask_tokens)
-                    loss = loss + a.mask_weight * mask_loss
+                    if mask_loss is not None:
+                        loss = loss + a.mask_weight * mask_loss
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite loss at step {step}")
             opt.zero_grad(set_to_none=True)
@@ -320,7 +324,9 @@ def main():
         if changed_frac is not None:
             extra += (("changed_frac", changed_frac),)
         if a.mask_weight:
-            extra += (("mask_loss", float(mask_loss)),)
+            extra += (("mask_skipped", float(mask_loss is None)),)
+            if mask_loss is not None:
+                extra += ((f"mask_loss_{kind}", float(mask_loss)),)
         for k, v in ((f"loss_{kind}", float(tok_loss)), *extra, ("gnorm", float(gn)),
                      ("tgt_std", float(h.std(0).mean())), ("pred_std", float(p.std(0).mean()))):
             acc.setdefault(k, []).append(v)

@@ -228,5 +228,4 @@ def test_supcon_prefers_grouped_embeddings():
     grouped = F.normalize(centers[lab] + 0.05 * torch.randn(1, 8, 16), dim=-1)
     rand = F.normalize(torch.randn(1, 8, 16), dim=-1)
     assert supcon(grouped, lab, 0.1, 64) < supcon(rand, lab, 0.1, 64)
-    with pytest.raises(ValueError, match="no object token"):
-        supcon(rand, torch.zeros(1, 8, dtype=torch.long), 0.1, 64)
+    assert supcon(rand, torch.zeros(1, 8, dtype=torch.long), 0.1, 64) is None

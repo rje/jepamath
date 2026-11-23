@@ -2,7 +2,7 @@
 # loss grouping encoder context tokens by rendered object (--mask-weight 0.5). Tests whether taught individuation
 # lifts the number-relevant VoE scores and the stage-0 count readout.
 [job]
-name = "trackb-v4b-128-mask05"
+name = "trackb-v4b-128-mask05b"
 command = "python -m jepatrain.train --out $RUN_DIR --data $DATA/v4b_128s --heldout $DATA/heldout_v4b_128/v4b_triples2000_128.pt --res 128 --duty 1.0 --power-ceiling 5000 --workers 12 --auto-resume --loss l2 --pool-weight 1.0 --change-weight 50 --p-prefix 0.5 --mask-weight 0.5 && python scripts/locate_surprise.py $RUN_DIR --weights weights_015000.pt weights_030000.pt --heldout $DATA/heldout_v4b_128/v4b_triples2000_128.pt --out $RUN_DIR/locate --device cuda && python scripts/visible_drop.py $RUN_DIR --weights weights_015000.pt weights_030000.pt --data $DATA/v4_vistest --n 400 --out $RUN_DIR/visdrop --device cuda"
 setup = ["pip install -q webdataset scikit-learn pyarrow pyyaml pydantic"]
 progress_regex = '"step": (\d+)'
@@ -44,7 +44,7 @@ min_ram_gb = 48
 min_inet_down_mbps = 500
 
 [budget]
-max_spend = 3.5
+max_spend = 3.0   # the first attempt (trackb-v4b-128-mask05) crashed for $0.70
 max_hours = 3
 
 [watch]

@@ -25,7 +25,7 @@ local = "v4_vistest"
 # RTX PRO 6000 (Blackwell, 96 GB): ~5090 speed on datacenter-grade hosts. Five 5090 bids in a row were lost
 # within minutes on 21 Nov; Max-Q (300 W) left out as slower
 gpus = ["RTX PRO 6000 S", "RTX PRO 6000 WS"]
-max_price_per_gpu = 1.00
+max_price_per_gpu = 1.50   # raised 23 Nov: at $1.00 this job was outbid 15 times in 4 h (8k steps for $4.11)
 # bid high (floor x 2, capped at $1): we pay the bid, and a low bid was preempted within minutes (21-22 Nov)
 bid_multiplier = 2.0
 # Blackwell (5090, PRO 6000) needs a CUDA 12.8 PyTorch build (sm_120) and a host driver that supports it
@@ -43,7 +43,7 @@ min_ram_gb = 64
 min_inet_down_mbps = 500
 
 [budget]
-max_spend = 8.0
+max_spend = 11.0   # raised from 8 on 23 Nov after the outbid churn
 max_hours = 7
 
 [watch]

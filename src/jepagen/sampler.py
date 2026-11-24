@@ -48,6 +48,9 @@ class SceneRanges(_Strict):
     palettes: tuple[Literal["random", "single", "two"], ...] = ("random", "single", "two")
     shapes_per_episode: tuple[int, int] = (1, 3)
     min_color_dist: float = 0.25   # RGB distance between any object colour and the tray floors
+    # object colour ranges (HSV saturation, value); a generalization probe can move them outside training
+    obj_sat: tuple[float, float] = (0.45, 0.9)
+    obj_val: tuple[float, float] = (0.6, 0.95)
 
 
 class Template(_Strict):
@@ -376,7 +379,7 @@ def _object_colors(rng, R: SceneRanges, n: int, floors: list) -> tuple[str, list
 
     def draw():
         for _ in range(200):
-            c = _hsv(rng, (0.45, 0.9), (0.6, 0.95))
+            c = _hsv(rng, R.obj_sat, R.obj_val)
             if all(_cdist(c, f) >= R.min_color_dist for f in floors):
                 return c
         raise RuntimeError("no object colour far enough from the tray floors")

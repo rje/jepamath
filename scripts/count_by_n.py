@@ -21,11 +21,16 @@ ap.add_argument("--readout", choices=("xfmr", "linear-mean"), nargs="+", default
                      "map can extrapolate past the counts it was fit on; the transformer tends to clamp). Sum pooling "
                      "would be redundant: every clip has the same token count, and features are standardised")
 ap.add_argument("--ridge", type=float, default=1.0)
+ap.add_argument("--encoder", choices=("context", "target"), default="context",
+                help="read the context encoder or the EMA target encoder (same architecture)")
 a = ap.parse_args()
 if torch.cuda.is_available():
     raise SystemExit("run with CUDA_VISIBLE_DEVICES=")
 torch.set_num_threads(40)
-enc, _t, _p, step = lp.load_run(a.run, a.weights, device="cpu"); enc.eval()
+enc, tgt, _p, step = lp.load_run(a.run, a.weights, device="cpu")
+if a.encoder == "target":
+    enc = tgt
+enc.eval()
 res = json.load(open(os.path.join(a.run, "args.json")))["res"]
 X, ys = [], {"box": [], "total": []}
 for s in wds.WebDataset(sorted(glob.glob(os.path.join(a.data, "train", "possible", "*.tar"))),
@@ -43,7 +48,7 @@ for s in wds.WebDataset(sorted(glob.glob(os.path.join(a.data, "train", "possible
     if len(X) == a.n:
         break
 X = torch.stack(X); tr, te = slice(0, a.n_train), slice(a.n_train, len(X))
-out = {"run": a.run, "step": step, "layer": a.layer, "train_max": a.train_max}
+out = {"run": a.run, "step": step, "layer": a.layer, "train_max": a.train_max, "encoder": a.encoder}
 for readout in a.readout:
     for tname, yy in ys.items():
         yy = torch.tensor(yy)

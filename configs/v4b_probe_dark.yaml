@@ -1,0 +1,37 @@
+# Generalization probe: v4b_small with object colours darker than anything in training (HSV value
+# 0.25-0.45; training 0.6-0.95). Same geometry, counts and dynamics.
+visibility_modes:
+- occluded
+- visible
+- mixed
+visibility_weights:
+- 0.34
+- 0.33
+- 0.33
+count_range:
+- 0
+- 3
+final_range:
+- 0
+- 3
+k_range:
+- 1
+- 1
+radius_range:
+- 0.035
+- 0.065
+area_ref_count: 2
+pile_h: 0.14
+scene:
+  box_inner:
+  - 0.28
+  - 0.32
+  hopper_inner:
+  - 0.25
+  - 0.28
+  cam_distance:
+  - 0.85
+  - 1.25
+  obj_val:
+  - 0.25
+  - 0.45

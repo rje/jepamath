@@ -72,7 +72,8 @@ def test_real_job_specs_load_and_resume():
     for f in sorted((ROOT / "cloud" / "jobs").glob("*.toml")):
         j = load_job(f)
         assert "--auto-resume" in j.command, f"{f.name}: a preemptible job must resume from $RUN_DIR"
-        assert j.budget.max_spend <= 10, f"{f.name}: test-run budget unexpectedly large"
+        # 12: the 256 px object-label run needed $11 after outbid churn (23 Nov); anything larger is likely a typo
+        assert j.budget.max_spend <= 12, f"{f.name}: test-run budget unexpectedly large"
 
 
 def test_unknown_budget_key_is_an_error(tmp_path):

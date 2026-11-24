@@ -105,6 +105,34 @@ def per_slot(tgt_idx: torch.Tensor, tokens_per_slot: int) -> int:
     return int(counts[0])
 
 
+def corrupt_labels(lab: torch.Tensor, flip: float, merge: bool) -> torch.Tensor:
+    """Object-label branch, tolerance test: degrade the per-token object labels lab [B, N] (0 = no object) the
+    way an imperfect unsupervised grouper might. merge: in each clip, the objects present are paired at random
+    and each pair shares one label (an odd one out keeps its own). flip: each token, with probability flip,
+    takes a label drawn uniformly from the labels present in its clip (background included; may redraw its
+    own). The corruption of a clip is a fixed function of its labels (a generator seeded from them), so a clip
+    gets the same errors every time it is seen, as from a real grouper, instead of noise that averages out over
+    epochs. Returns a new tensor; merge is applied before flip."""
+    if not 0.0 <= flip <= 1.0:
+        raise ValueError(f"flip must be in [0, 1], got {flip}")
+    lab = lab.clone()
+    w = torch.arange(1, lab.shape[1] + 1, device=lab.device)
+    for b in range(lab.shape[0]):
+        gen = torch.Generator().manual_seed(int((lab[b] * w).sum()) * 1000003 + int(lab[b].sum()))
+        if merge:
+            ids = lab[b].unique()
+            ids = ids[ids > 0]
+            ids = ids[torch.randperm(len(ids), generator=gen, device="cpu").to(ids.device)]
+            for i in range(0, len(ids) - 1, 2):
+                lab[b][lab[b] == ids[i + 1]] = ids[i]
+        if flip > 0:
+            present = lab[b].unique()
+            hit = torch.rand(lab.shape[1], generator=gen, device="cpu").to(lab.device) < flip
+            pick = torch.randint(len(present), (int(hit.sum()),), generator=gen, device="cpu").to(lab.device)
+            lab[b][hit] = present[pick]
+    return lab
+
+
 def supcon(e: torch.Tensor, lab: torch.Tensor, tau: float, k: int,
            gen: torch.Generator | None = None) -> torch.Tensor | None:
     """Object-label branch: supervised contrastive loss over each clip's context tokens. e [B, N, d] (unit norm),
@@ -154,6 +182,10 @@ def main():
     ap.add_argument("--mask-weight", type=float, default=0.0,
                     help="object-label branch (flag name kept for old runs): weight of a supervised contrastive loss that groups the encoder's context "
                          "tokens by rendered object (needs shards from prep_cloud --tokseg). 0 = label-free")
+    ap.add_argument("--label-flip", type=float, default=0.0,
+                    help="object-label tolerance test: fraction of token labels redrawn at random (see corrupt_labels)")
+    ap.add_argument("--label-merge", action="store_true",
+                    help="object-label tolerance test: objects merged in random pairs (see corrupt_labels)")
     ap.add_argument("--mask-tau", type=float, default=0.1)
     ap.add_argument("--mask-tokens", type=int, default=384, help="tokens per clip in the contrastive loss")
     ap.add_argument("--dim", type=int, default=384)
@@ -176,6 +208,8 @@ def main():
                     help="dump every thread's stack and exit if one step (or 3x this for an eval) takes longer; "
                          "0 disables. py-spy/gdb cannot attach here (ptrace_scope=1), so this is the hang probe")
     a = ap.parse_args()
+    if (a.label_flip or a.label_merge) and not a.mask_weight:
+        raise SystemExit("--label-flip/--label-merge corrupt the object labels: they need --mask-weight > 0")
 
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(a.seed)
@@ -269,6 +303,9 @@ def main():
             if tuple(tokseg.shape[1:]) != (enc.slots, enc.grid, enc.grid):
                 raise ValueError(f"tokseg {tuple(tokseg.shape)} does not match the encoder's tokens "
                                  f"({enc.slots}, {enc.grid}, {enc.grid})")
+            seglab = tokseg.flatten(1).long()
+            if a.label_flip or a.label_merge:
+                seglab = corrupt_labels(seglab, a.label_flip, a.label_merge)
         else:
             clips = batch.to(dev, non_blocking=True)
         kind, ctx, tg = sample_masks(rng, enc.slots, enc.grid, a.p_prefix)
@@ -304,7 +341,7 @@ def main():
                     pool_loss = dist(pp - hp).mean()
                     loss = tok_loss + a.pool_weight * pool_loss
                 if a.mask_weight:
-                    lab = torch.gather(tokseg.flatten(1).long(), 1, ctx)
+                    lab = torch.gather(seglab, 1, ctx)
                     e = F.normalize(head(z.float()), dim=-1)
                     mask_loss = supcon(e, lab, a.mask_tau, a.mask_tokens)
                     if mask_loss is not None:

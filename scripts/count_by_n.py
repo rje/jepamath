@@ -14,6 +14,8 @@ ap.add_argument("run"); ap.add_argument("--weights", required=True)
 ap.add_argument("--data", default="/mnt/data/jepamath/v4b_probe")
 ap.add_argument("--layer", type=int, default=8); ap.add_argument("--n", type=int, default=2000)
 ap.add_argument("--n-train", type=int, default=1400); ap.add_argument("--out", required=True)
+ap.add_argument("--train-max", type=int, nargs=2, metavar=("BOX", "TOTAL"), default=None,
+                help="extrapolation test: fit the readout only on training clips with count <= BOX / TOTAL")
 a = ap.parse_args()
 if torch.cuda.is_available():
     raise SystemExit("run with CUDA_VISIBLE_DEVICES=")
@@ -36,22 +38,26 @@ for s in wds.WebDataset(sorted(glob.glob(os.path.join(a.data, "train", "possible
     if len(X) == a.n:
         break
 X = torch.stack(X); tr, te = slice(0, a.n_train), slice(a.n_train, len(X))
-out = {"run": a.run, "step": step, "layer": a.layer}
+out = {"run": a.run, "step": step, "layer": a.layer, "train_max": a.train_max}
 for tname, yy in ys.items():
     yy = torch.tensor(yy)
+    keep = torch.arange(a.n_train)
+    if a.train_max is not None:
+        keep = keep[yy[tr] <= a.train_max[0 if tname == "box" else 1]]
+    Xf, yf = X[tr][keep], yy[tr][keep]
     torch.manual_seed(0)
     m = lp.XfmrReadout(X.shape[-1], X.shape[1])
     opt = torch.optim.AdamW(m.parameters(), lr=3e-4, weight_decay=1e-4)
     for _ in range(40):
         m.train()
-        for i in torch.randperm(a.n_train).split(64):
-            opt.zero_grad(); F.mse_loss(m(X[tr][i].float()), yy[tr][i].float()).backward(); opt.step()
+        for i in torch.randperm(len(yf)).split(64):
+            opt.zero_grad(); F.mse_loss(m(Xf[i].float()), yf[i].float()).backward(); opt.step()
     m.eval()
     with torch.no_grad():
         p = torch.cat([m(X[te][i:i + 256].float()) for i in range(0, len(X[te]), 256)])
     top = int(yy.max()); pr = p.round().clamp(0, top); t = yy[te]
     rows = []
-    print(f"target {tname} (layer {a.layer}, overall {float((pr == t).float().mean()) * 100:.1f}%)")
+    print(f"target {tname} (layer {a.layer}, fit on {len(yf)} clips, overall {float((pr == t).float().mean()) * 100:.1f}%)")
     print("   n   count   acc%   mean_pred   MAE")
     for n in range(top + 1):
         k = t == n

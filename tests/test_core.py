@@ -229,3 +229,27 @@ def test_supcon_prefers_grouped_embeddings():
     rand = F.normalize(torch.randn(1, 8, 16), dim=-1)
     assert supcon(grouped, lab, 0.1, 64) < supcon(rand, lab, 0.1, 64)
     assert supcon(rand, torch.zeros(1, 8, dtype=torch.long), 0.1, 64) is None
+
+
+def test_corrupt_labels_merge_flip_and_consistency():
+    import torch
+    from jepatrain.train import corrupt_labels
+    lab = torch.tensor([[0, 1, 1, 2, 2, 3, 3, 4, 4, 0] * 20, [0, 5, 5, 6, 6, 0, 0, 0, 0, 0] * 20])
+    # merge pairs four objects into two groups, and the two objects of clip 1 into one; background untouched
+    m = corrupt_labels(lab, 0.0, True)
+    assert len(m[0][m[0] > 0].unique()) == 2 and len(m[1][m[1] > 0].unique()) == 1
+    assert torch.equal(m == 0, lab == 0)
+    for a in (1, 2, 3, 4):   # each object stays whole
+        assert len(m[0][lab[0] == a].unique()) == 1
+    # flip: only labels already present, about the requested share changed, and the same errors every time
+    f = corrupt_labels(lab, 0.3, False)
+    assert set(f[0].tolist()) <= set(lab[0].tolist())
+    changed = float((f != lab).float().mean())
+    assert 0.12 < changed < 0.35
+    assert torch.equal(f, corrupt_labels(lab, 0.3, False))
+    assert torch.equal(corrupt_labels(lab, 0.0, False), lab)
+    try:
+        corrupt_labels(lab, 1.5, False)
+        raise AssertionError("flip > 1 accepted")
+    except ValueError:
+        pass

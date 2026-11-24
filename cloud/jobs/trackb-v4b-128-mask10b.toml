@@ -1,4 +1,4 @@
-# Mask branch dose: trackb-v4b-128-mask05b with --mask-weight 1.0 (does more grouping pressure give more
+# Object-label branch dose: trackb-v4b-128-mask05b with --mask-weight 1.0 (does more grouping pressure give more
 # individuation / count, or start to hurt prediction?).
 # Relaunched as mask10b: the first attempt (mask10) was preempted at step 750 and then hit three boot hangs ($0.79).
 [job]

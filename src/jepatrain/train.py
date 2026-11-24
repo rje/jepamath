@@ -107,7 +107,7 @@ def per_slot(tgt_idx: torch.Tensor, tokens_per_slot: int) -> int:
 
 def supcon(e: torch.Tensor, lab: torch.Tensor, tau: float, k: int,
            gen: torch.Generator | None = None) -> torch.Tensor | None:
-    """Mask branch: supervised contrastive loss over each clip's context tokens. e [B, N, d] (unit norm),
+    """Object-label branch: supervised contrastive loss over each clip's context tokens. e [B, N, d] (unit norm),
     lab [B, N] object label (0 = no object). Up to k random tokens per clip; anchors are object tokens with
     another token of the same object among them; every other sampled token is a negative.
     None when no token qualifies as an anchor: a long tube mask can leave only background cells as context
@@ -152,8 +152,8 @@ def main():
                          "token loss (a dropped object is ~1%% of tokens and otherwise barely moves the loss)")
     ap.add_argument("--change-thresh", type=float, default=10.0, help="pixel difference (0-255) for 'changed'")
     ap.add_argument("--mask-weight", type=float, default=0.0,
-                    help="mask branch: weight of a supervised contrastive loss that groups the encoder's context "
-                         "tokens by rendered object (needs shards from prep_cloud --tokseg). 0 = mask-free")
+                    help="object-label branch (flag name kept for old runs): weight of a supervised contrastive loss that groups the encoder's context "
+                         "tokens by rendered object (needs shards from prep_cloud --tokseg). 0 = label-free")
     ap.add_argument("--mask-tau", type=float, default=0.1)
     ap.add_argument("--mask-tokens", type=int, default=384, help="tokens per clip in the contrastive loss")
     ap.add_argument("--dim", type=int, default=384)

@@ -1,4 +1,4 @@
-# Mask branch at 100k: trackb-v4b-128-cw50-100k (mask-free; VoE handled 79.6% but count readout near chance) plus
+# Object-label branch at 100k: trackb-v4b-128-cw50-100k (mask-free; VoE handled 79.6% but count readout near chance) plus
 # --mask-weight 0.5 on the tokseg data. Matched mask vs no-mask at 100k; does the count keep rising past 30k?
 [job]
 name = "trackb-v4b-128-mask05-100k"

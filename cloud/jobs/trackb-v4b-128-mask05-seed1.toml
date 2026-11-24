@@ -1,4 +1,4 @@
-# Mask branch replicate: trackb-v4b-128-mask05b with --seed 1 (mask05b lifted the count readout to 57%/68% and
+# Object-label branch replicate: trackb-v4b-128-mask05b with --seed 1 (mask05b lifted the count readout to 57%/68% and
 # handled VoE to 78%; check it is not one lucky seed).
 [job]
 name = "trackb-v4b-128-mask05-seed1"

@@ -21,6 +21,8 @@ ap.add_argument("--readout", choices=("xfmr", "linear-mean"), nargs="+", default
                      "map can extrapolate past the counts it was fit on; the transformer tends to clamp). Sum pooling "
                      "would be redundant: every clip has the same token count, and features are standardised")
 ap.add_argument("--ridge", type=float, default=1.0)
+ap.add_argument("--test-data", default=None,
+                help="generalization test: fit the readout on --data, test on the first n - n_train clips of this set")
 ap.add_argument("--encoder", choices=("context", "target"), default="context",
                 help="read the context encoder or the EMA target encoder (same architecture)")
 a = ap.parse_args()
@@ -32,23 +34,36 @@ if a.encoder == "target":
     enc = tgt
 enc.eval()
 res = json.load(open(os.path.join(a.run, "args.json")))["res"]
-X, ys = [], {"box": [], "total": []}
-for s in wds.WebDataset(sorted(glob.glob(os.path.join(a.data, "train", "possible", "*.tar"))),
-                        shardshuffle=False, empty_check=False):
-    ep, frames, seg, state = lp.load_sample(s)
-    last = state["frames"][-1]
-    in_box = {o["id"] for o in last["objects"] if o["region"] == "box"}
-    orc = lp.oracle_tokens(seg[-1], enc.grid, in_box)
-    fr = lp.downsample(frames, res)
-    x = ((torch.from_numpy(fr[-enc.tubelet:])[None].permute(0, 4, 1, 2, 3).float() / 255 - lp.MEAN) / lp.STD)
-    toks, _ = lp.layers_and_attn(enc, x, lp.segments(orc[None])[0])
-    X.append(toks[a.layer].half())
-    ys["box"].append(int(ep["meta"]["final"]))
-    ys["total"].append(int(last["count_per_region"]["box"] + last["count_per_region"]["hopper"]))
-    if len(X) == a.n:
-        break
+def extract(data: str, n: int):
+    X, ys = [], {"box": [], "total": []}
+    for s in wds.WebDataset(sorted(glob.glob(os.path.join(data, "train", "possible", "*.tar"))),
+                            shardshuffle=False, empty_check=False):
+        ep, frames, seg, state = lp.load_sample(s)
+        last = state["frames"][-1]
+        in_box = {o["id"] for o in last["objects"] if o["region"] == "box"}
+        orc = lp.oracle_tokens(seg[-1], enc.grid, in_box)
+        fr = lp.downsample(frames, res)
+        x = ((torch.from_numpy(fr[-enc.tubelet:])[None].permute(0, 4, 1, 2, 3).float() / 255 - lp.MEAN) / lp.STD)
+        toks, _ = lp.layers_and_attn(enc, x, lp.segments(orc[None])[0])
+        X.append(toks[a.layer].half())
+        ys["box"].append(int(ep["meta"]["final"]))
+        ys["total"].append(int(last["count_per_region"]["box"] + last["count_per_region"]["hopper"]))
+        if len(X) == n:
+            break
+    if len(X) < n:
+        raise ValueError(f"{data}: only {len(X)} clips, need {n}")
+    return X, ys
+
+
+if a.test_data is None:
+    X, ys = extract(a.data, a.n)
+else:                       # fit on a.data, test on a.test_data (generalization: same readout, new clips)
+    X, ys = extract(a.data, a.n_train)
+    Xt, yt = extract(a.test_data, a.n - a.n_train)
+    X += Xt
+    ys = {k: ys[k] + yt[k] for k in ys}
 X = torch.stack(X); tr, te = slice(0, a.n_train), slice(a.n_train, len(X))
-out = {"run": a.run, "step": step, "layer": a.layer, "train_max": a.train_max, "encoder": a.encoder}
+out = {"run": a.run, "step": step, "layer": a.layer, "train_max": a.train_max, "encoder": a.encoder, "data": a.data, "test_data": a.test_data}
 for readout in a.readout:
     for tname, yy in ys.items():
         yy = torch.tensor(yy)

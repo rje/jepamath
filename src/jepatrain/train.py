@@ -161,6 +161,9 @@ def supcon(e: torch.Tensor, lab: torch.Tensor, tau: float, k: int,
 def main():
     ap = argparse.ArgumentParser(prog="jepatrain")
     ap.add_argument("--data", default="/mnt/data/jepamath/v2")
+    ap.add_argument("--early-data", default=None,
+                    help="curriculum: train on this data for the first --early-steps steps, then on --data")
+    ap.add_argument("--early-steps", type=int, default=0)
     ap.add_argument("--heldout", required=True, help="held-out triples at --res (jepatrain.data.build_heldout)")
     ap.add_argument("--res", type=int, required=True, help="input px; v2 is rendered at 256")
     ap.add_argument("--patch", type=int, default=8)
@@ -210,6 +213,8 @@ def main():
     a = ap.parse_args()
     if (a.label_flip or a.label_merge) and not a.mask_weight:
         raise SystemExit("--label-flip/--label-merge corrupt the object labels: they need --mask-weight > 0")
+    if bool(a.early_data) != bool(a.early_steps) or not 0 <= a.early_steps < a.steps:
+        raise SystemExit("--early-data and --early-steps go together, with 0 < --early-steps < --steps")
 
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(a.seed)
@@ -245,11 +250,16 @@ def main():
     # start the loader workers before the held-out set is in memory, so forked workers don't carry it
     with open(a.heldout + ".ids.json") as f:
         exclude = set(json.load(f))
-    loader = torch.utils.data.DataLoader(PossibleClips(a.data, exclude, a.res, seed=a.seed + step,
-                                                       tokseg=bool(a.mask_weight)), batch_size=a.batch,
-                                         num_workers=a.workers, pin_memory=True, persistent_workers=True,
-                                         prefetch_factor=4)
+    def make_loader(data, ctx=None):
+        return torch.utils.data.DataLoader(PossibleClips(data, exclude, a.res, seed=a.seed + step,
+                                                         tokseg=bool(a.mask_weight)), batch_size=a.batch,
+                                           num_workers=a.workers, pin_memory=True, persistent_workers=True,
+                                           prefetch_factor=4, multiprocessing_context=ctx)
+    early = a.early_data is not None and step < a.early_steps
+    loader = make_loader(a.early_data if early else a.data)
     it = iter(loader)
+    if early:
+        print(f"[train] curriculum: {a.early_data} until step {a.early_steps}, then {a.data}", flush=True)
     triples = torch.load(a.heldout, weights_only=False)
     if {t["seed_id"] for t in triples} != exclude:
         raise RuntimeError("held-out ids file does not match the held-out triples")
@@ -297,6 +307,11 @@ def main():
     enc.train(); pred.train()
     while step < a.steps:
         arm()
+        if early and step >= a.early_steps:
+            # spawned workers: forked ones would carry the held-out set, which is in memory by now
+            del it, loader
+            loader = make_loader(a.data, ctx="spawn"); it = iter(loader); early = False
+            print(f"[train] curriculum: step {step}, switched to {a.data}", flush=True)
         batch = next(it)
         if a.mask_weight:
             clips, tokseg = batch[0].to(dev, non_blocking=True), batch[1].to(dev, non_blocking=True)

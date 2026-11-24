@@ -272,3 +272,19 @@ def test_motion_seg_groups_moving_object_not_static_or_shadow():
     assert all((m[s] == ids[0]).any() for s in range(4))
     assert not m[:, 5:7, 5:7].any()                         # static square: no group
     assert not m[:, 6:, :3].any()                           # shadow: no group
+
+
+def test_sequential_glides_one_object_at_a_time():
+    """glide_mode sequential (v5_show): objects glide one after another, never two at once, all before the first
+    action; the default (together) samples exactly as before (checked against v5 elsewhere)."""
+    from jepagen.sampler import Manifest, Template, load_yaml, sample_episode
+    t = load_yaml(os.path.join(os.path.dirname(__file__), "..", "configs", "v5_show.yaml"), Template)
+    n_multi = 0
+    for seed in range(60):
+        ep = sample_episode(t, Manifest(), "train", 300000 + seed)
+        g = sorted(ep.glides, key=lambda x: x.t_start)
+        assert all(a.t_end <= b.t_start + 1e-9 for a, b in zip(g, g[1:]))
+        if g:
+            assert g[-1].t_end <= min(a.t_start for a in ep.actions)
+        n_multi += len(g) >= 2
+    assert n_multi > 20

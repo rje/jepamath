@@ -35,7 +35,7 @@ if a.encoder == "target":
 enc.eval()
 res = json.load(open(os.path.join(a.run, "args.json")))["res"]
 def extract(data: str, n: int):
-    X, ys = [], {"box": [], "total": []}
+    X, ys, modes = [], {"box": [], "total": []}, []
     for s in wds.WebDataset(sorted(glob.glob(os.path.join(data, "train", "possible", "*.tar"))),
                             shardshuffle=False, empty_check=False):
         ep, frames, seg, state = lp.load_sample(s)
@@ -47,20 +47,21 @@ def extract(data: str, n: int):
         toks, _ = lp.layers_and_attn(enc, x, lp.segments(orc[None])[0])
         X.append(toks[a.layer].half())
         ys["box"].append(int(ep["meta"]["final"]))
+        modes.append(ep["meta"]["control_mode"])
         ys["total"].append(int(last["count_per_region"]["box"] + last["count_per_region"]["hopper"]))
         if len(X) == n:
             break
     if len(X) < n:
         raise ValueError(f"{data}: only {len(X)} clips, need {n}")
-    return X, ys
+    return X, ys, modes
 
 
 if a.test_data is None:
-    X, ys = extract(a.data, a.n)
+    X, ys, modes = extract(a.data, a.n)
 else:                       # fit on a.data, test on a.test_data (generalization: same readout, new clips)
-    X, ys = extract(a.data, a.n_train)
-    Xt, yt = extract(a.test_data, a.n - a.n_train)
-    X += Xt
+    X, ys, modes = extract(a.data, a.n_train)
+    Xt, yt, mt = extract(a.test_data, a.n - a.n_train)
+    X += Xt; modes += mt
     ys = {k: ys[k] + yt[k] for k in ys}
 X = torch.stack(X); tr, te = slice(0, a.n_train), slice(a.n_train, len(X))
 out = {"run": a.run, "step": step, "layer": a.layer, "train_max": a.train_max, "encoder": a.encoder, "data": a.data, "test_data": a.test_data}
@@ -102,5 +103,14 @@ for readout in a.readout:
             rows.append(r)
             print(f"  {n:2d}   {r['count']:5d}  {r['acc']:5.1f}   {r['mean_pred']:8.2f}  {r['mae']:5.2f}")
         out[f"{readout}/{tname}"] = rows
+        # shortcut control: in area_matched clips the box objects shrink as the final box count grows (total area
+        # ~constant within the radius range), so an area code cannot tell box counts apart there
+        mte = modes[a.n_train:]
+        for mode in sorted(set(mte)):
+            k = torch.tensor([m_ == mode for m_ in mte])
+            per = {n: (round(float((pr[k & (t == n)] == n).float().mean() * 100), 1), round(float(p[k & (t == n)].mean()), 2))
+                   for n in range(top + 1) if (k & (t == n)).any()}
+            print(f"   {mode:13s} acc {float((pr[k] == t[k]).float().mean()) * 100:5.1f}%   by n (acc%, mean_pred): {per}")
+            out[f"{readout}/{tname}/{mode}"] = {"acc": float((pr[k] == t[k]).float().mean() * 100), "by_n": per}
 os.makedirs(os.path.dirname(a.out), exist_ok=True)
 json.dump(out, open(a.out, "w"), indent=1)

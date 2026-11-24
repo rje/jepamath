@@ -84,6 +84,9 @@ class Template(_Strict):
     glide_phase_s: tuple[float, float] = (0.0, 0.0)
     glide_prob: float = 0.8           # per object in the box or hopper
     glide_s: tuple[float, float] = (0.7, 1.5)
+    # "together": glides overlap at random times; "sequential": one object at a time, the rest still (each gets an
+    # equal share of the phase, in random order), the clean common-fate cue of an object being shown
+    glide_mode: Literal["together", "sequential"] = "together"
     transfer_s: tuple[float, float] = (1.6, 2.0)
     screen_move_s: tuple[float, float] = (0.3, 0.5)
     clip: Clip = Clip(n_frames=32, fps=4, width=256, height=256)
@@ -511,10 +514,17 @@ def sample_episode(t: Template, man: Manifest, split: str, seed: int) -> Episode
         chosen = [o for o in movers if rng.uniform() < t.glide_prob]
         if movers and not chosen:
             chosen = [movers[int(rng.integers(len(movers)))]]
-        for o in chosen:
+        if t.glide_mode == "sequential":
+            chosen = [chosen[i] for i in rng.permutation(len(chosen))]
+        share = g_phase / max(1, len(chosen)) if t.glide_mode == "sequential" else g_phase
+        for i_g, o in enumerate(chosen):
             tray = box if o.start_region == "box" else hopper
-            d = min(float(rng.uniform(*t.glide_s)), g_phase)
-            t0 = float(rng.uniform(0.2, 0.2 + g_phase - d))
+            d = min(float(rng.uniform(*t.glide_s)), share)
+            if t.glide_mode == "sequential":
+                lo = 0.2 + i_g * share
+                t0 = float(rng.uniform(lo, lo + max(0.0, share - d)))   # d == share: rounding can go below lo
+            else:
+                t0 = float(rng.uniform(0.2, 0.2 + g_phase - d))
             m = radii[o.id] + 0.012
             hx, hy = tray.inner_size[0] / 2 - m, tray.inner_size[1] / 2 - m
             # a target clear of every other object's start spot and of the targets already chosen

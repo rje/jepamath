@@ -46,6 +46,10 @@ class Vast:
                 return json.loads(raw) if raw.strip() else {}
         except urllib.error.HTTPError as e:
             raise VastError(f"{method} {path} -> {e.code}: {e.read().decode()[:400]}") from e
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            # network failure (DNS, timeout, reset): a VastError, so the supervisor's poll loop retries it and its
+            # cleanup still runs (24 Nov: an unwrapped URLError killed the supervisor and left a box running 12 h)
+            raise VastError(f"{method} {path} -> network error: {e}") from e
 
     def search(self, m: Machine, gpu: str) -> list[dict]:
         q = {"gpu_name": {"eq": gpu}, "num_gpus": {"eq": m.num_gpus}, "rentable": {"eq": True},

@@ -467,3 +467,17 @@ def test_a_box_that_never_boots_is_replaced_after_boot_min():
     assert sup.decide(sup.Obs(**{**base, "now": 13 * 60}), j)[0] == "replace_failure"
     booted = {**base, "now": 13 * 60, "hb": {"phase": "data", "step": 0}}
     assert sup.decide(sup.Obs(**booted), j)[0] == "continue"          # booted: setup_grace applies
+
+
+def test_vast_network_error_is_vast_error(monkeypatch):
+    """A DNS/timeout failure must surface as VastError, which the supervisor's poll loop retries."""
+    import urllib.error
+    import urllib.request
+    import pytest
+    from cloudrun.vast import Vast, VastError
+
+    def boom(*a, **k):
+        raise urllib.error.URLError("[Errno -3] Temporary failure in name resolution")
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    with pytest.raises(VastError, match="network error"):
+        Vast("k").instances()

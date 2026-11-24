@@ -19,13 +19,13 @@ from multiprocessing import Pool
 import numpy as np
 
 
-def convert(args: tuple[str, str, int, int | None, int]) -> tuple[str, int]:
+def convert(args: tuple[str, str, int, int | None, int, str]) -> tuple[str, int]:
     import torch
     import webdataset as wds
 
-    from .data import downsample, token_seg
+    from .data import downsample, motion_seg, token_seg
     torch.set_num_threads(1)
-    src, dst, res, patch, tubelet = args
+    src, dst, res, patch, tubelet, labels = args
     tmp = dst + ".tmp"
     n = 0
     with wds.TarWriter(tmp) as w:
@@ -37,7 +37,13 @@ def convert(args: tuple[str, str, int, int | None, int]) -> tuple[str, int]:
             out = {"__key__": s["__key__"], "clip.npz": buf.getvalue(), "episode.json": s["episode.json"]}
             if patch is not None:
                 tb = io.BytesIO()
-                np.save(tb, token_seg(z["seg"], res, patch, tubelet))
+                if labels == "render":
+                    lab = token_seg(z["seg"], res, patch, tubelet)
+                elif labels == "motion":
+                    lab = motion_seg(frames, patch, tubelet)    # pixels only, at the training resolution
+                else:
+                    raise ValueError(f"unknown labels {labels!r}")
+                np.save(tb, lab)
                 out["tokseg.npy"] = tb.getvalue()
             w.write(out)
             n += 1
@@ -53,15 +59,20 @@ def main() -> int:
     ap.add_argument("--procs", type=int, default=22)
     ap.add_argument("--res", type=int, required=True)
     ap.add_argument("--tokseg", type=int, nargs=2, metavar=("PATCH", "TUBELET"), default=None,
-                    help="also store per-token object labels for the mask branch (encoder patch and tubelet)")
+                    help="also store per-token object labels for the object-label branch (encoder patch and tubelet)")
+    ap.add_argument("--labels", choices=("render", "motion"), default="render",
+                    help="render: the renderer's object ids (token_seg); motion: label-free groups from motion "
+                         "(motion_seg, pixels only), stored in the same tokseg.npy slot")
     a = ap.parse_args()
+    if a.labels != "render" and not a.tokseg:
+        raise SystemExit("--labels needs --tokseg PATCH TUBELET")
     patch, tubelet = a.tokseg if a.tokseg else (None, 0)
     shards = sorted(glob.glob(os.path.join(a.src, a.split, "possible", "*.tar")))
     if not shards:
         raise FileNotFoundError(f"no shards under {a.src}/{a.split}/possible")
     od = os.path.join(a.out, a.split, "possible")
     os.makedirs(od, exist_ok=True)
-    jobs = [(s, os.path.join(od, os.path.basename(s)), a.res, patch, tubelet) for s in shards if not os.path.exists(os.path.join(od, os.path.basename(s)))]
+    jobs = [(s, os.path.join(od, os.path.basename(s)), a.res, patch, tubelet, a.labels) for s in shards if not os.path.exists(os.path.join(od, os.path.basename(s)))]
     total = 0
     with Pool(min(a.procs, max(1, len(jobs)))) as p:
         for name, n in p.imap_unordered(convert, jobs):
@@ -72,7 +83,7 @@ def main() -> int:
     for s in sorted(glob.glob(os.path.join(od, "*.tar"))):
         counts[os.path.basename(s)] = sum(1 for _ in wds.WebDataset([s], shardshuffle=False, empty_check=False))
     with open(os.path.join(a.out, f"manifest-{a.split}-possible.json"), "w") as f:
-        json.dump({"source": a.src, "res": a.res, "tokseg": a.tokseg, "shards": counts, "clips": sum(counts.values())}, f, indent=1)
+        json.dump({"source": a.src, "res": a.res, "tokseg": a.tokseg, "labels": a.labels if a.tokseg else None, "shards": counts, "clips": sum(counts.values())}, f, indent=1)
     print(f"{sum(counts.values())} clips in {len(counts)} shards -> {od}")
     return 0
 

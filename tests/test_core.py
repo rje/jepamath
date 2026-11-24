@@ -253,3 +253,22 @@ def test_corrupt_labels_merge_flip_and_consistency():
         raise AssertionError("flip > 1 accepted")
     except ValueError:
         pass
+
+
+def test_motion_seg_groups_moving_object_not_static_or_shadow():
+    import numpy as np
+    from jepatrain.data import motion_seg
+    T, H = 16, 64
+    f = np.full((T, H, H, 3), 128, np.uint8)
+    for t in range(T):
+        x = 4 + 2 * t                                       # red square slides right, 2 px per frame
+        f[t, 8:24, x:x + 16] = (200, 40, 40)
+        f[t, 40:56, 40:56] = (40, 40, 200)                  # blue square never moves
+        f[t, 44:60, 2 + t:18 + t] //= 2                     # a moving shadow: darker, same chroma
+    m = motion_seg(f, 8, 4)
+    assert m.shape == (4, 8, 8)
+    ids = np.unique(m[m > 0])
+    assert len(ids) == 1, ids                               # one group, kept across all four tubelets
+    assert all((m[s] == ids[0]).any() for s in range(4))
+    assert not m[:, 5:7, 5:7].any()                         # static square: no group
+    assert not m[:, 6:, :3].any()                           # shadow: no group

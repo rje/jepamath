@@ -16,6 +16,11 @@ ap.add_argument("--layer", type=int, default=8); ap.add_argument("--n", type=int
 ap.add_argument("--n-train", type=int, default=1400); ap.add_argument("--out", required=True)
 ap.add_argument("--train-max", type=int, nargs=2, metavar=("BOX", "TOTAL"), default=None,
                 help="extrapolation test: fit the readout only on training clips with count <= BOX / TOTAL")
+ap.add_argument("--readout", choices=("xfmr", "linear-mean"), nargs="+", default=["xfmr"],
+                help="xfmr: the transformer readout of layer_probe; linear-mean: ridge regression on mean-pooled tokens (a linear "
+                     "map can extrapolate past the counts it was fit on; the transformer tends to clamp). Sum pooling "
+                     "would be redundant: every clip has the same token count, and features are standardised")
+ap.add_argument("--ridge", type=float, default=1.0)
 a = ap.parse_args()
 if torch.cuda.is_available():
     raise SystemExit("run with CUDA_VISIBLE_DEVICES=")
@@ -39,34 +44,43 @@ for s in wds.WebDataset(sorted(glob.glob(os.path.join(a.data, "train", "possible
         break
 X = torch.stack(X); tr, te = slice(0, a.n_train), slice(a.n_train, len(X))
 out = {"run": a.run, "step": step, "layer": a.layer, "train_max": a.train_max}
-for tname, yy in ys.items():
-    yy = torch.tensor(yy)
-    keep = torch.arange(a.n_train)
-    if a.train_max is not None:
-        keep = keep[yy[tr] <= a.train_max[0 if tname == "box" else 1]]
-    Xf, yf = X[tr][keep], yy[tr][keep]
-    torch.manual_seed(0)
-    m = lp.XfmrReadout(X.shape[-1], X.shape[1])
-    opt = torch.optim.AdamW(m.parameters(), lr=3e-4, weight_decay=1e-4)
-    for _ in range(40):
-        m.train()
-        for i in torch.randperm(len(yf)).split(64):
-            opt.zero_grad(); F.mse_loss(m(Xf[i].float()), yf[i].float()).backward(); opt.step()
-    m.eval()
-    with torch.no_grad():
-        p = torch.cat([m(X[te][i:i + 256].float()) for i in range(0, len(X[te]), 256)])
-    top = int(yy.max()); pr = p.round().clamp(0, top); t = yy[te]
-    rows = []
-    print(f"target {tname} (layer {a.layer}, fit on {len(yf)} clips, overall {float((pr == t).float().mean()) * 100:.1f}%)")
-    print("   n   count   acc%   mean_pred   MAE")
-    for n in range(top + 1):
-        k = t == n
-        if k.sum() == 0:
-            continue
-        r = {"n": n, "count": int(k.sum()), "acc": float((pr[k] == n).float().mean() * 100),
-             "mean_pred": float(p[k].mean()), "mae": float((p[k] - n).abs().mean())}
-        rows.append(r)
-        print(f"  {n:2d}   {r['count']:5d}  {r['acc']:5.1f}   {r['mean_pred']:8.2f}  {r['mae']:5.2f}")
-    out[tname] = rows
+for readout in a.readout:
+    for tname, yy in ys.items():
+        yy = torch.tensor(yy)
+        keep = torch.arange(a.n_train)
+        if a.train_max is not None:
+            keep = keep[yy[tr] <= a.train_max[0 if tname == "box" else 1]]
+        Xf, yf = X[tr][keep], yy[tr][keep]
+        if readout == "xfmr":
+            torch.manual_seed(0)
+            m = lp.XfmrReadout(X.shape[-1], X.shape[1])
+            opt = torch.optim.AdamW(m.parameters(), lr=3e-4, weight_decay=1e-4)
+            for _ in range(40):
+                m.train()
+                for i in torch.randperm(len(yf)).split(64):
+                    opt.zero_grad(); F.mse_loss(m(Xf[i].float()), yf[i].float()).backward(); opt.step()
+            m.eval()
+            with torch.no_grad():
+                p = torch.cat([m(X[te][i:i + 256].float()) for i in range(0, len(X[te]), 256)])
+        else:
+            Ptr, Pte = Xf.float().mean(1), X[te].float().mean(1)
+            mu, sd = Ptr.mean(0), Ptr.std(0) + 1e-6                  # standardise on the fit set only
+            Ptr, Pte = (Ptr - mu) / sd, (Pte - mu) / sd
+            A = torch.cat([Ptr, torch.ones(len(Ptr), 1)], 1).double()
+            W = torch.linalg.solve(A.T @ A + a.ridge * torch.eye(A.shape[1], dtype=A.dtype), A.T @ yf.double()[:, None])
+            p = (torch.cat([Pte, torch.ones(len(Pte), 1)], 1).double() @ W)[:, 0].float()
+        top = int(yy.max()); pr = p.round().clamp(0, top); t = yy[te]
+        rows = []
+        print(f"target {tname} ({readout}, layer {a.layer}, fit on {len(yf)} clips, overall {float((pr == t).float().mean()) * 100:.1f}%)")
+        print("   n   count   acc%   mean_pred   MAE")
+        for n in range(top + 1):
+            k = t == n
+            if k.sum() == 0:
+                continue
+            r = {"n": n, "count": int(k.sum()), "acc": float((pr[k] == n).float().mean() * 100),
+                 "mean_pred": float(p[k].mean()), "mae": float((p[k] - n).abs().mean())}
+            rows.append(r)
+            print(f"  {n:2d}   {r['count']:5d}  {r['acc']:5.1f}   {r['mean_pred']:8.2f}  {r['mae']:5.2f}")
+        out[f"{readout}/{tname}"] = rows
 os.makedirs(os.path.dirname(a.out), exist_ok=True)
 json.dump(out, open(a.out, "w"), indent=1)

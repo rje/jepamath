@@ -85,6 +85,69 @@ def token_seg(seg: np.ndarray, res: int, patch: int, tubelet: int, min_frac: flo
     return out
 
 
+def motion_seg(frames: np.ndarray, patch: int, tubelet: int, thresh: float = 0.06, min_area: int = 12,
+               link_iou: float = 0.2, min_frac: float = 0.125, cue: str = "chroma") -> np.ndarray:
+    """Label-free object groups from motion (common fate), in the layout of token_seg: frames uint8 [T, H, W, 3]
+    -> uint8 [T // tubelet, G, G], G = H // patch, 0 = no group. Uses pixels only, no renderer labels:
+    background = per-pixel temporal median; foreground = pixels differing from it by > thresh, cleaned by a 3x3
+    opening. cue "chroma" compares brightness-normalised colour (r, g, b) / (r + g + b), so moving shadows (a
+    brightness change) are not foreground; cue "rgb" compares raw values / 255 (max over channels); groups = connected foreground blobs of >= min_area pixels in each
+    tubelet's middle frame, linked across tubelets by mask IoU >= link_iou (greedy, so a group keeps one id
+    over time). A token takes the group covering most of its patch if groups cover >= min_frac of it.
+    Known errors, kept on purpose (they are what a real grouper gets): objects that never move are not
+    grouped; touching objects (and an object with the claw carrying it) merge; an object resting at one
+    place for most of the clip joins the background, so its other positions show up as ghost blobs."""
+    from scipy import ndimage
+    T, H, W, _ = frames.shape
+    G = H // patch
+    if H != W or H % patch or T % tubelet:
+        raise ValueError(f"frames {frames.shape} do not tile into {T // tubelet} x {G} x {G} tokens")
+    if cue == "chroma":
+        x = frames.astype(np.float32)
+        x = x / (x.sum(-1, keepdims=True) + 30.0)      # + 30: dark pixels have no reliable chroma
+    elif cue == "rgb":
+        x = frames.astype(np.float32) / 255.0
+    else:
+        raise ValueError(f"unknown cue {cue!r}")
+    bg = np.median(x, axis=0)
+    out = np.zeros((T // tubelet, G, G), dtype=np.uint8)
+    prev: list[tuple[int, np.ndarray]] = []           # (group id, mask) in the previous tubelet
+    next_id = 1
+    for s in range(T // tubelet):
+        fg = np.abs(x[s * tubelet + tubelet // 2] - bg).max(-1) > thresh
+        fg = ndimage.binary_opening(fg, structure=np.ones((3, 3), bool))
+        lab, n = ndimage.label(fg)
+        cur: list[tuple[int, np.ndarray]] = []
+        taken: set[int] = set()
+        for c in range(1, n + 1):
+            m = lab == c
+            if m.sum() < min_area:
+                continue
+            best, best_iou = None, link_iou
+            for gid, pm in prev:
+                if gid in taken:
+                    continue
+                iou = (m & pm).sum() / (m | pm).sum()
+                if iou >= best_iou:
+                    best, best_iou = gid, iou
+            if best is None:
+                if next_id > 255:
+                    raise ValueError("motion_seg: more than 255 groups in one clip")
+                best, next_id = next_id, next_id + 1
+            taken.add(best)
+            cur.append((best, m))
+        grid = np.zeros((H, W), dtype=np.int32)
+        for gid, m in cur:
+            grid[m] = gid
+        blk = grid.reshape(G, patch, G, patch).transpose(0, 2, 1, 3).reshape(G, G, -1)
+        for gid, _m in cur:
+            cnt = (blk == gid).sum(-1)
+            sel = (cnt >= min_frac * blk.shape[-1]) & (cnt > ((blk > 0) & (blk != gid)).sum(-1))
+            out[s][sel] = gid
+        prev = cur
+    return out
+
+
 class PossibleClips(torch.utils.data.IterableDataset):
     """Endless stream of possible clips (uint8 [T, res, res, 3]) from v2 shards, minus held-out seeds.
     Shards are split across workers and reshuffled every pass; a buffer shuffles clips within a worker."""

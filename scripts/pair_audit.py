@@ -15,7 +15,7 @@ every other token of the clip, labelled or not, is a negative. For anchors whose
 fp_share does not count pairs of two background tokens inside one group (a ghost with itself).
 Pairs are counted over all tokens of a clip (SupCon samples tokens uniformly, which leaves these shares unchanged).
 Label sources: render (token_seg), render+flip30, render+merge (jepatrain.train.corrupt_labels, the S0 tolerance
-runs), motion (motion_seg), track (track_seg).
+runs), motion (motion_seg), track (track_seg), render@track (renderer ids on track's labelled tokens).
 
     python scripts/pair_audit.py --data /mnt/data/jepamath/v4b --n 300 --out OUT.json
 """
@@ -93,6 +93,7 @@ def main():
                "render+merge": corrupt_labels(tl, 0.0, True).numpy().reshape(t.shape),
                "motion": motion_seg(fr, a.patch, a.tubelet),
                "track": track_seg(fr, a.patch, a.tubelet)}
+        src["render@track"] = np.where(src["track"] > 0, t, 0).astype(t.dtype)   # S3-recall control labels
         for k, g in src.items():
             tot[k] = tot.get(k, 0) + pair_counts(g, t)
         n += 1

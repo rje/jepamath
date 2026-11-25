@@ -12,8 +12,8 @@ labels (jepatrain.data.token_seg; claw and screen count as background) and its p
   figure    : logistic probe, object vs background token, balanced accuracy on held-out clips.
   kind      : logistic probe, shape (sphere / box / cylinder) from an object's mean token in the last slot.
   size      : ridge probe, log cube-root volume of the object from its mean token (R^2).
-              kind, size and the 3D probes standardise features and pick their regularisation by 5-fold CV on the
-              training clips only. (No extent probe: at 128 px / patch 8 objects are ~2 x 2 tokens, so nearly every
+              kind, size and the 3D probes standardise features and pick their regularisation by 5-fold CV grouped by clip,
+              on the training clips only. (No extent probe: at 128 px / patch 8 objects are ~2 x 2 tokens, so nearly every
               object token is on the edge; checked 25 Nov, 2364 of 2367 tokens at distance 1.)
   depth3d / height3d : ridge probes on the object's mean token for its camera depth (along the view axis) and the
               height of its bottom above the table, each first residualised on the object's image centroid and token
@@ -35,7 +35,8 @@ import sys
 import numpy as np
 import torch
 import webdataset as wds
-from sklearn.linear_model import LogisticRegression, LogisticRegressionCV, RidgeCV
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.model_selection import GridSearchCV, GroupKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -208,10 +209,14 @@ def score(raw, L, boot=0, seed=0):
     ftr = raw["fig_clip"] < ntr
     fig_p = LogisticRegression(C=0.1, max_iter=2000).fit(d["fig"][ftr], raw["fig_y"][ftr]).predict(d["fig"][~ftr])
     om = raw["obj_meta"]; oclip = om[:, 7].astype(int); otr = oclip < ntr
-    kind_p = make_pipeline(StandardScaler(), LogisticRegressionCV(Cs=[1e-3, 1e-2, 0.1, 1], max_iter=5000)).fit(
-        d["obj"][otr], om[otr, 0]).predict(d["obj"][~otr])
-    ridge = lambda X, y: make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-1, 4, 11))).fit(  # noqa: E731
-        X[otr], y[otr]).predict(X[~otr])
+    # regularisation by 5-fold CV grouped by clip: objects in one clip share camera and scene, so ungrouped folds
+    # (RidgeCV's default is leave-one-out) leak a clip into its own validation, pick too little regularisation and
+    # overfit (25 Nov: test R^2 down to -1.2 on plain encoders)
+    def cv_fit(est, grid, y):
+        g = GridSearchCV(make_pipeline(StandardScaler(), est), grid, cv=GroupKFold(5))
+        return g.fit(d["obj"][otr], y[otr], groups=oclip[otr]).predict(d["obj"][~otr])
+    kind_p = cv_fit(LogisticRegression(max_iter=5000), {"logisticregression__C": [1e-3, 1e-2, 0.1, 1]}, om[:, 0])
+    ridge = lambda X, y: cv_fit(Ridge(), {"ridge__alpha": np.logspace(-1, 5, 13)}, y)  # noqa: E731
     size_p = ridge(d["obj"], om[:, 1])
     img = np.c_[om[:, 4:7], np.ones(len(om))]                      # image centroid y, x and log token area
     resid = {}

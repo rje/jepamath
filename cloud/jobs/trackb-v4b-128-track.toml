@@ -37,7 +37,7 @@ min_ram_gb = 48
 min_inet_down_mbps = 500
 
 [budget]
-max_spend = 3.0   # the first attempt (trackb-v4b-128-mask05) crashed for $0.70
+max_spend = 4.5   # 3.0 first; raised after 6 preemptions stopped it at step 26k ($2.63)
 max_hours = 3
 
 [watch]

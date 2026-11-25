@@ -2,6 +2,7 @@
 For each true count n: test accuracy, mean prediction, mean abs error. Number-sense signatures to look for:
 accuracy falling with n (Weber-like), small n exact (subitizing), errors scaling with n."""
 import argparse, glob, json, os, sys
+import numpy as np
 import torch
 import torch.nn.functional as F
 import webdataset as wds
@@ -23,6 +24,8 @@ ap.add_argument("--readout", choices=("xfmr", "linear-mean"), nargs="+", default
 ap.add_argument("--ridge", type=float, default=1.0)
 ap.add_argument("--test-data", default=None,
                 help="generalization test: fit the readout on --data, test on the first n - n_train clips of this set")
+ap.add_argument("--moved-thresh", type=float, default=0.02,
+                help="motion shortcut test: a box object 'moved' if its max displacement over the clip exceeds this (m)")
 ap.add_argument("--encoder", choices=("context", "target"), default="context",
                 help="read the context encoder or the EMA target encoder (same architecture)")
 a = ap.parse_args()
@@ -34,8 +37,14 @@ if a.encoder == "target":
     enc = tgt
 enc.eval()
 res = json.load(open(os.path.join(a.run, "args.json")))["res"]
+def _max_disp(frames, oid) -> float:
+    """Largest distance an object gets from where it was first seen, over the clip."""
+    ps = np.array([o["pos"] for f in frames for o in f["objects"] if o["id"] == oid])
+    return float(np.linalg.norm(ps - ps[0], axis=1).max())
+
+
 def extract(data: str, n: int):
-    X, ys, modes = [], {"box": [], "total": []}, []
+    X, ys, modes, moved = [], {"box": [], "total": []}, [], []
     for s in wds.WebDataset(sorted(glob.glob(os.path.join(data, "train", "possible", "*.tar"))),
                             shardshuffle=False, empty_check=False):
         ep, frames, seg, state = lp.load_sample(s)
@@ -48,20 +57,22 @@ def extract(data: str, n: int):
         X.append(toks[a.layer].half())
         ys["box"].append(int(ep["meta"]["final"]))
         modes.append(ep["meta"]["control_mode"])
+        moved.append(sum(_max_disp(state["frames"], o["id"]) > a.moved_thresh
+                         for o in last["objects"] if o["region"] == "box"))
         ys["total"].append(int(last["count_per_region"]["box"] + last["count_per_region"]["hopper"]))
         if len(X) == n:
             break
     if len(X) < n:
         raise ValueError(f"{data}: only {len(X)} clips, need {n}")
-    return X, ys, modes
+    return X, ys, modes, moved
 
 
 if a.test_data is None:
-    X, ys, modes = extract(a.data, a.n)
+    X, ys, modes, moved = extract(a.data, a.n)
 else:                       # fit on a.data, test on a.test_data (generalization: same readout, new clips)
-    X, ys, modes = extract(a.data, a.n_train)
-    Xt, yt, mt = extract(a.test_data, a.n - a.n_train)
-    X += Xt; modes += mt
+    X, ys, modes, moved = extract(a.data, a.n_train)
+    Xt, yt, mt, mvt = extract(a.test_data, a.n - a.n_train)
+    X += Xt; modes += mt; moved += mvt
     ys = {k: ys[k] + yt[k] for k in ys}
 X = torch.stack(X); tr, te = slice(0, a.n_train), slice(a.n_train, len(X))
 out = {"run": a.run, "step": step, "layer": a.layer, "train_max": a.train_max, "encoder": a.encoder, "data": a.data, "test_data": a.test_data}
@@ -112,5 +123,18 @@ for readout in a.readout:
                    for n in range(top + 1) if (k & (t == n)).any()}
             print(f"   {mode:13s} acc {float((pr[k] == t[k]).float().mean()) * 100:5.1f}%   by n (acc%, mean_pred): {per}")
             out[f"{readout}/{tname}/{mode}"] = {"acc": float((pr[k] == t[k]).float().mean() * 100), "by_n": per}
+        if tname == "box":
+            # motion shortcut test: does the prediction track box objects that moved, or all box objects?
+            mv = np.array(moved[a.n_train:]); st_ = t.numpy() - mv; pn = p.numpy()
+            cells = {f"{n}box/{m}moved": (int(((t.numpy() == n) & (mv == m)).sum()),
+                                           round(float((pr.numpy()[(t.numpy() == n) & (mv == m)] == n).mean() * 100), 1),
+                                           round(float(pn[(t.numpy() == n) & (mv == m)].mean()), 2))
+                     for n in range(top + 1) for m in range(n + 1) if ((t.numpy() == n) & (mv == m)).sum() >= 5}
+            A = np.c_[mv, st_, np.ones(len(mv))]
+            coef = np.linalg.lstsq(A, pn, rcond=None)[0]
+            print(f"   by (box, moved): (clips, acc%, mean_pred) {cells}")
+            print(f"   pred ~ {coef[0]:.2f} * moved + {coef[1]:.2f} * still + {coef[2]:.2f}   (a true count gives 1.00 and 1.00)")
+            out[f"{readout}/box/moved_test"] = {"cells": cells, "coef_moved": float(coef[0]), "coef_still": float(coef[1]),
+                                                "intercept": float(coef[2]), "moved_thresh": a.moved_thresh}
 os.makedirs(os.path.dirname(a.out), exist_ok=True)
 json.dump(out, open(a.out, "w"), indent=1)

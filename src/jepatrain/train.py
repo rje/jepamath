@@ -134,7 +134,8 @@ def corrupt_labels(lab: torch.Tensor, flip: float, merge: bool) -> torch.Tensor:
 
 
 def supcon(e: torch.Tensor, lab: torch.Tensor, tau: float, k: int,
-           gen: torch.Generator | None = None, slot: torch.Tensor | None = None) -> torch.Tensor | None:
+           gen: torch.Generator | None = None, slot: torch.Tensor | None = None,
+           negatives: str = "clean") -> torch.Tensor | None:
     """Object-label branch: supervised contrastive loss over each clip's context tokens. e [B, N, d] (unit norm),
     lab [B, N] object label (0 = no object). Up to k random tokens per clip; anchors are object tokens with
     another token of the same object among them; every other sampled token is a negative.
@@ -144,7 +145,10 @@ def supcon(e: torch.Tensor, lab: torch.Tensor, tau: float, k: int,
     contrast runs over the whole batch; positives are same-label tokens of the clip (any slot), and negatives are
     every token of the other clips plus labelled tokens of another label in the anchor's own slot. Unlabelled
     tokens of the clip, and other-label tokens of other slots, are left out: a grouper that misses an object or
-    switches its id over time would otherwise mark the object's own tokens as negatives."""
+    switches its id over time would otherwise mark the object's own tokens as negatives. (Run 25 Nov: other clips
+    as negatives let the loss be solved by a per-clip signature; grouping and count collapsed.)
+    negatives="slot" (with slot) keeps the contrast inside each clip: positives as above (any slot), negatives are
+    the other-label or unlabelled tokens of the anchor's own slot only."""
     B, N, _ = e.shape
     if N > k:
         idx = torch.stack([torch.randperm(N, device=e.device, generator=gen)[:k] for _ in range(B)])
@@ -152,17 +156,20 @@ def supcon(e: torch.Tensor, lab: torch.Tensor, tau: float, k: int,
         lab = torch.gather(lab, 1, idx)
         if slot is not None:
             slot = torch.gather(slot, 1, idx)
-    if slot is not None:
+    if slot is not None and negatives == "clean":
         return _supcon_clean(e, lab, slot, tau)
-    sim = (e @ e.transpose(1, 2)).float() / tau                      # [B, k, k]
-    eye = torch.eye(sim.shape[1], dtype=torch.bool, device=e.device)
-    sim = sim.masked_fill(eye, float("-inf"))
-    logp = sim - torch.logsumexp(sim, -1, keepdim=True)
+    if negatives not in ("clean", "slot"):
+        raise ValueError(f"negatives must be 'clean' or 'slot', got {negatives!r}")
+    eye = torch.eye(e.shape[1], dtype=torch.bool, device=e.device)
     pos = (lab[:, :, None] == lab[:, None, :]) & (lab[:, :, None] > 0) & ~eye
     n_pos = pos.sum(-1)
     anchor = n_pos > 0
     if not anchor.any():
         return None
+    sim = (e @ e.transpose(1, 2)).float() / tau                      # [B, k, k]
+    keep = ~eye if slot is None else pos | ((slot[:, :, None] == slot[:, None, :]) & ~pos & ~eye)
+    sim = sim.masked_fill(~keep, float("-inf"))
+    logp = sim - torch.logsumexp(sim, -1, keepdim=True)
     per = -(logp.masked_fill(~pos, 0.0)).sum(-1) / n_pos.clamp(min=1)
     return per[anchor].mean()
 
@@ -217,10 +224,11 @@ def main():
                     help="object-label tolerance test: fraction of token labels redrawn at random (see corrupt_labels)")
     ap.add_argument("--label-merge", action="store_true",
                     help="object-label tolerance test: objects merged in random pairs (see corrupt_labels)")
-    ap.add_argument("--mask-negatives", choices=("clip", "clean"), default="clip",
+    ap.add_argument("--mask-negatives", choices=("clip", "clean", "slot"), default="clip",
                     help="clip: every other token of the clip is a negative (renderer labels). clean: for grouper "
                          "labels; unlabelled and other-slot tokens of the clip are left out and the other clips' "
-                         "tokens are negatives (see supcon)")
+                         "tokens are negatives (see supcon; failed via a clip shortcut). slot: negatives only from "
+                         "the anchor's own slot of its own clip")
     ap.add_argument("--mask-tau", type=float, default=0.1)
     ap.add_argument("--mask-tokens", type=int, default=384, help="tokens per clip in the contrastive loss")
     ap.add_argument("--dim", type=int, default=384)
@@ -390,8 +398,9 @@ def main():
                 if a.mask_weight:
                     lab = torch.gather(seglab, 1, ctx)
                     e = F.normalize(head(z.float()), dim=-1)
-                    slot = ctx // enc.tokens_per_slot if a.mask_negatives == "clean" else None
-                    mask_loss = supcon(e, lab, a.mask_tau, a.mask_tokens, slot=slot)
+                    slot = ctx // enc.tokens_per_slot if a.mask_negatives != "clip" else None
+                    mask_loss = supcon(e, lab, a.mask_tau, a.mask_tokens, slot=slot,
+                                       negatives="slot" if a.mask_negatives == "slot" else "clean")
                     if mask_loss is not None:
                         loss = loss + a.mask_weight * mask_loss
             if not torch.isfinite(loss):

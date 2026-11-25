@@ -10,6 +10,8 @@ every other token of the clip, labelled or not, is a negative. For anchors whose
               same-object tokens under another label remain: track id switches, split objects)
   fn_share_clean : also only same-slot tokens as same-clip negatives (positives still span the clip), so a track
               id switch across time no longer marks the object's earlier tokens as negatives
+  fn_share_slot : negatives are every other-label or unlabelled token of the anchor's own slot (supcon
+              negatives="slot"); the contrast stays inside the clip
 fp_share does not count pairs of two background tokens inside one group (a ghost with itself).
 Pairs are counted over all tokens of a clip (SupCon samples tokens uniformly, which leaves these shares unchanged).
 Label sources: render (token_seg), render+flip30, render+merge (jepatrain.train.corrupt_labels, the S0 tolerance
@@ -36,14 +38,16 @@ from jepatrain.data import downsample, motion_seg, token_seg, track_seg  # noqa:
 from jepatrain.train import corrupt_labels  # noqa: E402
 
 
-def fn_same_slot(g: np.ndarray, t: np.ndarray) -> float:
-    """Same-object negatives when only labelled tokens of the anchor's own slot are negatives (g, t [S, G, G])."""
+def fn_same_slot(g: np.ndarray, t: np.ndarray, unlabelled: bool = False) -> float:
+    """Same-object negatives when only tokens of the anchor's own slot are negatives (g, t [S, G, G]): labelled
+    tokens only (supcon negatives="clean", within the clip), or unlabelled ones too (negatives="slot")."""
     out = 0
     for gs, ts in zip(g.astype(np.int64), t.astype(np.int64)):
         C = np.zeros((max(g.max(), 1) + 1, max(t.max(), 1) + 1), dtype=np.int64)
         np.add.at(C, (gs.ravel(), ts.ravel()), 1)
         obj = C[1:, 1:]
-        out += (obj * (obj.sum(0)[None] - obj)).sum()
+        tot = C[:, 1:].sum(0) if unlabelled else obj.sum(0)
+        out += (obj * (tot[None] - obj)).sum()
     return float(out)
 
 
@@ -62,7 +66,8 @@ def pair_counts(g: np.ndarray, t: np.ndarray) -> np.ndarray:
     fn = (obj * (T[None, 1:] - obj)).sum()
     fp = (Cg * (Gk[:, None] - Cg)).sum()        # every anchor's positives that are a different true label
     fn_lab = (obj * (obj.sum(0)[None] - obj)).sum()   # same-object negatives among labelled tokens only
-    return np.array([tp, fn, fp, obj.sum(), T[1:].sum(), fn_lab, fn_same_slot(g_sh, t_sh)], dtype=float)
+    return np.array([tp, fn, fp, obj.sum(), T[1:].sum(), fn_lab, fn_same_slot(g_sh, t_sh),
+                     fn_same_slot(g_sh, t_sh, unlabelled=True)], dtype=float)
 
 
 def main():
@@ -96,13 +101,15 @@ def main():
     if n < a.n:
         raise ValueError(f"only {n} clips, need {a.n}")
     res = {"data": a.data, "n": n}
-    for k, (tp, fn, fp, anc, objt, fn_lab, fn_slot) in tot.items():
+    for k, (tp, fn, fp, anc, objt, fn_lab, fn_slot, fn_slot_all) in tot.items():
         res[k] = {"fn_share": fn / (tp + fn), "fp_share": fp / (tp + fp) if tp + fp else None,
                   "anchors": anc / objt, "fn_share_ignore_unlabelled": fn_lab / (tp + fn_lab),
-                  "fn_share_clean": fn_slot / (tp + fn_slot)}
+                  "fn_share_clean": fn_slot / (tp + fn_slot),
+                  "fn_share_slot": fn_slot_all / (tp + fn_slot_all)}
         print(f"{k:14s} fn_share {res[k]['fn_share']:.3f}  fp_share {res[k]['fp_share']:.3f}  "
               f"anchors {res[k]['anchors']:.3f}  fn_share if unlabelled ignored {res[k]['fn_share_ignore_unlabelled']:.3f}  "
-              f"clean (also same-slot negatives only) {res[k]['fn_share_clean']:.3f}")
+              f"clean (also same-slot negatives only) {res[k]['fn_share_clean']:.3f}  "
+              f"slot (own slot, unlabelled included) {res[k]['fn_share_slot']:.3f}")
     json.dump(res, open(a.out, "w"), indent=1)
 
 

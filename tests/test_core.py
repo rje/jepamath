@@ -266,6 +266,31 @@ def test_supcon_clean_negatives():
     assert supcon(e, torch.zeros_like(lab), 0.1, 64, slot=slot) is None
 
 
+def test_supcon_slot_negatives():
+    """negatives="slot": the contrast stays inside each clip and inside the anchor's slot; positives span slots."""
+    import torch
+    import torch.nn.functional as F
+    from jepatrain.train import supcon
+    torch.manual_seed(0)
+    lab = torch.tensor([[1, 1, 2, 0, 3, 3, 0]])
+    slot = torch.tensor([[0, 1, 0, 0, 2, 2, 1]])
+    f = lambda e, l=lab, s=slot: supcon(e, l, 0.1, 64, slot=s, negatives="slot")
+    e = F.normalize(torch.randn(1, 7, 16), dim=-1)
+    # labels 3 sit alone in slot 2: no other token's negatives include them, and their own term has no negatives
+    e2 = e.clone(); e2[0, 4:6] = e[0, 0]
+    assert torch.allclose(f(e), f(e2))
+    # an unlabelled token in the anchor's slot is a negative: moving it onto anchor 0 raises the loss
+    e3 = e.clone(); e3[0, 3] = e[0, 0]
+    assert f(e3) > f(e) + 1e-4
+    # another clip never enters: a second, unlabelled clip changes nothing
+    eb = torch.cat([e, F.normalize(torch.randn(1, 7, 16), dim=-1)])
+    eb2 = torch.cat([e, e])
+    lb, sb = torch.cat([lab, torch.zeros_like(lab)]), torch.cat([slot, slot])
+    assert torch.allclose(f(eb, lb, sb), f(eb2, lb, sb)) and torch.allclose(f(eb, lb, sb), f(e))
+    # without slot, the default (clip) loss is unchanged by the new argument
+    assert torch.allclose(supcon(e, lab, 0.1, 64), supcon(e, lab, 0.1, 64, negatives="slot"))
+
+
 def test_corrupt_labels_merge_flip_and_consistency():
     import torch
     from jepatrain.train import corrupt_labels

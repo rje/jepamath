@@ -231,6 +231,41 @@ def test_supcon_prefers_grouped_embeddings():
     assert supcon(rand, torch.zeros(1, 8, dtype=torch.long), 0.1, 64) is None
 
 
+def test_supcon_clean_negatives():
+    """Clean negatives: unlabelled tokens of the clip, and other-label tokens of other slots, do not enter the
+    loss; other clips' tokens are negatives; same-label tokens are positives across slots."""
+    import torch
+    import torch.nn.functional as F
+    from jepatrain.train import supcon
+    torch.manual_seed(0)
+    lab = torch.tensor([[1, 1, 2, 2, 0, 0, 3, 3]])
+    slot = torch.tensor([[0, 1, 0, 1, 0, 1, 1, 1]])
+    e = F.normalize(torch.randn(1, 8, 16), dim=-1)
+    base = supcon(e, lab, 0.1, 64, slot=slot)
+    e2 = e.clone(); e2[0, 4:6] = F.normalize(torch.randn(2, 16), dim=-1)       # move the unlabelled tokens
+    assert torch.allclose(supcon(e2, lab, 0.1, 64, slot=slot), base)
+    # other-label tokens of other slots stay out (a track id switch over time): labels 3 sit only in slot 2, so
+    # moving them leaves the loss unchanged, while the clip-negatives loss does change
+    lab_s, slot_s = torch.tensor([[1, 1, 2, 0, 3, 3]]), torch.tensor([[0, 1, 0, 0, 2, 2]])
+    e5 = F.normalize(torch.randn(1, 6, 16), dim=-1)
+    e6 = e5.clone(); e6[0, 4:6] = e5[0, 0]
+    assert torch.allclose(supcon(e5, lab_s, 0.1, 64, slot=slot_s), supcon(e6, lab_s, 0.1, 64, slot=slot_s))
+    assert not torch.allclose(supcon(e5, lab_s, 0.1, 64), supcon(e6, lab_s, 0.1, 64))
+    # a second clip's tokens are negatives: making them equal to clip 0's anchors raises the loss
+    eb = F.normalize(torch.randn(2, 8, 16), dim=-1); eb[0] = e[0]
+    labb = torch.cat([lab, torch.zeros_like(lab)]); slotb = torch.cat([slot, slot])
+    far = supcon(eb, labb, 0.1, 64, slot=slotb)
+    eb2 = eb.clone(); eb2[1] = e[0]
+    assert supcon(eb2, labb, 0.1, 64, slot=slotb) > far
+    # positives pull across slots: label 1 split over slots 0 and 1, grouped beats random
+    centers = F.normalize(torch.randn(4, 16), dim=-1)
+    grouped = F.normalize(centers[lab] + 0.05 * torch.randn(1, 8, 16), dim=-1)
+    two = lambda x: torch.cat([x, F.normalize(torch.randn(1, 8, 16), dim=-1)])
+    lab2, slot2 = torch.cat([lab, lab + (lab > 0) * 10]), torch.cat([slot, slot])
+    assert supcon(two(grouped), lab2, 0.1, 64, slot=slot2) < supcon(two(e), lab2, 0.1, 64, slot=slot2)
+    assert supcon(e, torch.zeros_like(lab), 0.1, 64, slot=slot) is None
+
+
 def test_corrupt_labels_merge_flip_and_consistency():
     import torch
     from jepatrain.train import corrupt_labels

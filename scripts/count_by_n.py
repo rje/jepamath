@@ -114,6 +114,8 @@ for readout in a.readout:
             rows.append(r)
             print(f"  {n:2d}   {r['count']:5d}  {r['acc']:5.1f}   {r['mean_pred']:8.2f}  {r['mae']:5.2f}")
         out[f"{readout}/{tname}"] = rows
+        out[f"{readout}/{tname}/pred"] = [float(v) for v in p]     # raw test predictions, for bootstrap CIs
+        out[f"{readout}/{tname}/pred_int"] = [int(v) for v in pr]  # rounded and clamped, as scored above
         # shortcut control: in area_matched clips the box objects shrink as the final box count grows (total area
         # ~constant within the radius range), so an area code cannot tell box counts apart there
         mte = modes[a.n_train:]
@@ -136,5 +138,7 @@ for readout in a.readout:
             print(f"   pred ~ {coef[0]:.2f} * moved + {coef[1]:.2f} * still + {coef[2]:.2f}   (a true count gives 1.00 and 1.00)")
             out[f"{readout}/box/moved_test"] = {"cells": cells, "coef_moved": float(coef[0]), "coef_still": float(coef[1]),
                                                 "intercept": float(coef[2]), "moved_thresh": a.moved_thresh}
+out["test_meta"] = {"box": ys["box"][a.n_train:], "total": ys["total"][a.n_train:], "mode": modes[a.n_train:],
+                    "moved": [int(m) for m in moved[a.n_train:]]}
 os.makedirs(os.path.dirname(a.out), exist_ok=True)
 json.dump(out, open(a.out, "w"), indent=1)

@@ -274,6 +274,74 @@ def test_motion_seg_groups_moving_object_not_static_or_shadow():
     assert not m[:, 6:, :3].any()                           # shadow: no group
 
 
+def _track_clip(draw):
+    import numpy as np
+    f = np.full((16, 128, 128, 3), 128, np.uint8)
+    for t in range(16):
+        draw(f[t], t)
+    return f
+
+
+def test_track_seg_keeps_a_stopped_object():
+    """moves for 6 frames, then rests 10 (so the median background absorbs it): one id in every tubelet;
+    motion_seg loses it once it stops"""
+    import numpy as np
+    from jepatrain.data import motion_seg, track_seg
+
+    def draw(fr, t):
+        x = 10 + 3 * min(t, 6)
+        fr[40:52, x:x + 12] = (200, 40, 40)
+    f = _track_clip(draw)
+    g = track_seg(f, 8, 4)
+    ids = [set(np.unique(g[s][g[s] > 0])) for s in range(4)]
+    assert all(len(i) == 1 for i in ids) and len(set.union(*ids)) == 1, ids
+    assert not motion_seg(f, 8, 4)[2:].any()
+
+
+def test_track_seg_drops_the_ghost_of_a_rest_place():
+    """rests 10 frames, then moves away: the empty rest place differs from the median background but looks like
+    its surroundings, so it gets no group; the moving object does"""
+    import numpy as np
+    from jepatrain.data import motion_seg, track_seg
+
+    def draw(fr, t):
+        x = 28 + 4 * max(t - 9, 0)
+        fr[40:52, x:x + 12] = (200, 40, 40)
+    f = _track_clip(draw)
+    g, m = track_seg(f, 8, 4), motion_seg(f, 8, 4)
+    rest = (slice(5, 6), slice(3, 5))                       # tokens of the rest place, empty at frame 14
+    assert m[3][rest].any() and not g[3][rest].any()
+    assert g[3].any()
+
+
+def test_track_seg_reidentifies_after_occlusion():
+    """slides right, unseen for frames 8-11, seen again further on: the same id before and after"""
+    import numpy as np
+    from jepatrain.data import track_seg
+
+    def draw(fr, t):
+        if not 8 <= t <= 11:
+            x = 4 + 3 * t
+            fr[40:52, x:x + 12] = (200, 40, 40)
+    g = track_seg(_track_clip(draw), 8, 4)
+    ids = [set(np.unique(g[s][g[s] > 0])) for s in range(4)]
+    assert ids[2] == set() and ids[0] == ids[1] == ids[3] and len(ids[0]) == 1, ids
+
+
+def test_track_seg_drops_surfaces_not_hand_sized():
+    """a 30 x 30 moving panel (900 px > 450) and a 4:1 bar get no group; a 12 x 12 object beside them does"""
+    import numpy as np
+    from jepatrain.data import track_seg
+
+    def draw(fr, t):
+        fr[4:34, 4 + 5 * t:34 + 5 * t] = (40, 200, 40)      # fast enough that the median background stays empty
+        fr[100:106, 4 + 5 * t:28 + 5 * t] = (40, 40, 200)
+        fr[70:82, 80 + 2 * t:92 + 2 * t] = (200, 40, 40)
+    g = track_seg(_track_clip(draw), 8, 4)
+    assert not g[:, :5].any() and not g[:, 12:].any()
+    assert g[:, 8:11].any()
+
+
 def test_sequential_glides_one_object_at_a_time():
     """glide_mode sequential (v5_show): objects glide one after another, never two at once, all before the first
     action; the default (together) samples exactly as before (checked against v5 elsewhere)."""

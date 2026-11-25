@@ -148,6 +148,118 @@ def motion_seg(frames: np.ndarray, patch: int, tubelet: int, thresh: float = 0.0
     return out
 
 
+def track_seg(frames: np.ndarray, patch: int, tubelet: int, thresh: float = 0.06, min_area: int = 12,
+              link_iou: float = 0.2, min_frac: float = 0.125, app_tol: float = 0.5, reid_dist: float = 0.25,
+              ring: int = 3, max_area: float | None = 450, max_elong: float | None = 3.0) -> np.ndarray:
+    """Label-free object groups from motion plus persistence (S2 tracking grouper), same layout and cue as
+    motion_seg (chroma, temporal-median background, blobs linked by mask IoU). Pixels only. Three additions, each
+    the infant principle it stands for:
+      ghosts      : a blob whose mean colour matches the ring of pixels around it (within app_tol * thresh, max
+                    over channels) is background showing through where an object rested, not an object: dropped.
+      persistence : a track with no blob this tubelet keeps its last mask and id if the pixels there still match
+                    its appearance (mean colour within app_tol * thresh) and still stand out from their ring. So an
+                    object that stops, and is absorbed into the median background, stays one group with one id.
+      re-identity : a track that is lost (occluded, or gone) is remembered; a blob with no IoU link (reappearing,
+                    or moved further than its own width since the last tubelet) takes the id of the nearest lost or
+                    active track whose appearance matches, within reid_dist * H of where it was last seen.
+      hand-sized  : a blob larger than max_area px (at 128 px; scaled by (H / 128)^2) or with a bounding box more
+                    than max_elong times longer than wide is a surface, not a graspable object: dropped. In v5 this
+                    is mostly the moving occluder screen, 45% of motion_seg's grouped tokens (thresholds read off
+                    renderer statistics on 150 clips, 25 Nov: objects reach 380 px at the 99th percentile)
+    Kept errors, as in motion_seg: objects that never move are not grouped; touching objects merge."""
+    from scipy import ndimage
+    T, H, W, _ = frames.shape
+    G = H // patch
+    if H != W or H % patch or T % tubelet:
+        raise ValueError(f"frames {frames.shape} do not tile into {T // tubelet} x {G} x {G} tokens")
+    x = frames.astype(np.float32)
+    x = x / (x.sum(-1, keepdims=True) + 30.0)
+    bg = np.median(x, axis=0)
+    tol = app_tol * thresh
+    out = np.zeros((T // tubelet, G, G), dtype=np.uint8)
+    ring_k = np.ones((2 * ring + 1, 2 * ring + 1), bool)
+
+    def contrast(f, m, fg):
+        """max-channel |mean colour inside - mean colour of the surrounding ring| (ring excludes other foreground);
+        None if the ring is too small to judge."""
+        r = ndimage.binary_dilation(m, ring_k) & ~ndimage.binary_dilation(m) & ~fg
+        if r.sum() < min_area:
+            return None
+        return float(np.abs(f[m].mean(0) - f[r].mean(0)).max())
+
+    def centroid(m):
+        return np.argwhere(m).mean(0)
+
+    active: dict[int, tuple[np.ndarray, np.ndarray]] = {}    # id -> (mask, mean colour), seen last tubelet
+    lost: dict[int, tuple[np.ndarray, np.ndarray]] = {}      # id -> (centroid, mean colour)
+    next_id = 1
+    for s in range(T // tubelet):
+        f = x[s * tubelet + tubelet // 2]
+        fg = np.abs(f - bg).max(-1) > thresh
+        fg = ndimage.binary_opening(fg, structure=np.ones((3, 3), bool))
+        lab, n = ndimage.label(fg)
+        cur: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for c in range(1, n + 1):
+            m = lab == c
+            if m.sum() < min_area:
+                continue
+            if max_area is not None and m.sum() > max_area * (H / 128) ** 2:
+                continue
+            if max_elong is not None:
+                ys, xs = np.nonzero(m)
+                h, w = np.ptp(ys) + 1, np.ptp(xs) + 1
+                if max(h, w) > max_elong * min(h, w):
+                    continue
+            col = f[m].mean(0)
+            k = contrast(f, m, fg)
+            if k is not None and k < tol:
+                continue                                       # ghost: looks like its surroundings
+            best, best_iou = None, link_iou
+            for gid, (pm, _c) in active.items():
+                if gid in cur:
+                    continue
+                iou = (m & pm).sum() / (m | pm).sum()
+                if iou >= best_iou:
+                    best, best_iou = gid, iou
+            if best is None:                                   # no overlap (lost, or moved past its own width):
+                cm, bd = centroid(m), reid_dist * H            # the nearest track that looks the same
+                cands = {**lost, **{gid: (centroid(pm), pc) for gid, (pm, pc) in active.items()}}
+                for gid, (lc, lcol) in cands.items():
+                    d = float(np.linalg.norm(cm - lc))
+                    if gid not in cur and np.abs(col - lcol).max() < tol and d < bd:
+                        best, bd = gid, d
+            if best is None:
+                if next_id > 255:
+                    raise ValueError("track_seg: more than 255 groups in one clip")
+                best, next_id = next_id, next_id + 1
+            lost.pop(best, None)
+            cur[best] = (m, col)
+        taken = np.zeros((H, W), bool)
+        for m, _c in cur.values():
+            taken |= m
+        for gid, (pm, pcol) in active.items():                 # unlinked tracks: at rest, or lost
+            if gid in cur:
+                continue
+            m = pm & ~taken
+            if m.sum() >= min_area and np.abs(f[m].mean(0) - pcol).max() < tol:
+                k = contrast(f, m, fg | taken)
+                if k is None or k >= tol:
+                    cur[gid] = (m, pcol)
+                    taken |= m
+                    continue
+            lost[gid] = (centroid(pm), pcol)
+        grid = np.zeros((H, W), dtype=np.int32)
+        for gid, (m, _c) in cur.items():
+            grid[m] = gid
+        blk = grid.reshape(G, patch, G, patch).transpose(0, 2, 1, 3).reshape(G, G, -1)
+        for gid in cur:
+            cnt = (blk == gid).sum(-1)
+            sel = (cnt >= min_frac * blk.shape[-1]) & (cnt > ((blk > 0) & (blk != gid)).sum(-1))
+            out[s][sel] = gid
+        active = cur
+    return out
+
+
 class PossibleClips(torch.utils.data.IterableDataset):
     """Endless stream of possible clips (uint8 [T, res, res, 3]) from v2 shards, minus held-out seeds.
     Shards are split across workers and reshuffled every pass; a buffer shuffles clips within a worker."""

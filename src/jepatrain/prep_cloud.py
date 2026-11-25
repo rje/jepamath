@@ -23,7 +23,7 @@ def convert(args: tuple[str, str, int, int | None, int, str]) -> tuple[str, int]
     import torch
     import webdataset as wds
 
-    from .data import downsample, motion_seg, token_seg
+    from .data import downsample, motion_seg, token_seg, track_seg
     torch.set_num_threads(1)
     src, dst, res, patch, tubelet, labels = args
     tmp = dst + ".tmp"
@@ -41,6 +41,10 @@ def convert(args: tuple[str, str, int, int | None, int, str]) -> tuple[str, int]
                     lab = token_seg(z["seg"], res, patch, tubelet)
                 elif labels == "motion":
                     lab = motion_seg(frames, patch, tubelet)    # pixels only, at the training resolution
+                elif labels == "track":
+                    lab = track_seg(frames, patch, tubelet)     # pixels only: motion + persistence + hand-sized prior
+                elif labels == "track-noprior":
+                    lab = track_seg(frames, patch, tubelet, max_area=None, max_elong=None)  # S2 attribution arm
                 else:
                     raise ValueError(f"unknown labels {labels!r}")
                 np.save(tb, lab)
@@ -60,9 +64,11 @@ def main() -> int:
     ap.add_argument("--res", type=int, required=True)
     ap.add_argument("--tokseg", type=int, nargs=2, metavar=("PATCH", "TUBELET"), default=None,
                     help="also store per-token object labels for the object-label branch (encoder patch and tubelet)")
-    ap.add_argument("--labels", choices=("render", "motion"), default="render",
+    ap.add_argument("--labels", choices=("render", "motion", "track", "track-noprior"), default="render",
                     help="render: the renderer's object ids (token_seg); motion: label-free groups from motion "
-                         "(motion_seg, pixels only), stored in the same tokseg.npy slot")
+                         "(motion_seg, pixels only); track: the S2 tracking grouper (track_seg: motion + persistence "
+                         "+ hand-sized prior, pixels only); track-noprior: track_seg without the hand-sized prior. "
+                         "All stored in the same tokseg.npy slot")
     a = ap.parse_args()
     if a.labels != "render" and not a.tokseg:
         raise SystemExit("--labels needs --tokseg PATCH TUBELET")

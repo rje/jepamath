@@ -28,7 +28,7 @@ from pathlib import Path
 from . import b2
 from .config import load_job, load_project
 from .creds import b2_from_file, read_env_file, vast_key
-from .supervisor import State, data_gb, heartbeat, run
+from .supervisor import State, data_gb, heartbeat, run, recover
 from .vast import Vast, fmt_offers, rank
 
 
@@ -81,6 +81,13 @@ def main(argv=None) -> int:
     if a.cmd in ("offers", "plan", "launch"):
         job = load_job(jobfile(a.job))
         vast = Vast(vast_key(project.vast_env))
+        if a.cmd == "launch":
+            # close anything a previous supervisor left billing before any precheck can fail
+            st = State(project.path(project.state_dir) / f"{job.name}.json", job.name)
+            prior = recover(st, vast, lambda m: print(m, flush=True))
+            if prior:
+                print(f"{job.name}: {prior} (decided before a previous supervisor's destroy failed)")
+                return 0 if prior.startswith("done") else 1
         down_gb = data_gb(job, project, s3)
         ranked = rank(vast.search_all(job.machine), job.machine, down_gb)
         print(f"{len(ranked)} eligible offers for {job.machine.gpus} x{job.machine.num_gpus} "

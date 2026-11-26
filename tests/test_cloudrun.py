@@ -485,14 +485,16 @@ def test_vast_network_error_is_vast_error(monkeypatch):
 
 # ---------- 26 Nov perf review: stale heartbeat, failed-host avoidance, destroy retries ----------
 
-def test_a_stale_heartbeat_is_a_wedged_box():
+def test_a_stale_pulse_is_a_wedged_box():
     j = job(watch=Watch(hb_stale_min=12, setup_grace_min=40))
     hb = {"phase": "data", "step": 0, "exit_rc": None}
-    assert sup.decide(obs(hb=hb, t_hb=10_000.0 - 11 * 60), j)[0] == "continue"
-    a, r = sup.decide(obs(hb=hb, t_hb=10_000.0 - 13 * 60), j)
+    assert sup.decide(obs(hb=hb, t_pulse=10_000.0 - 11 * 60), j)[0] == "continue"
+    a, r = sup.decide(obs(hb=hb, t_pulse=10_000.0 - 13 * 60), j)
     assert a == "replace_failure" and "wedged" in r
     done = {"phase": "done", "step": 600, "exit_rc": 0}
-    assert sup.decide(obs(hb=done, t_hb=10_000.0 - 60 * 60), j)[0] == "done"   # exit status wins
+    assert sup.decide(obs(hb=done, t_pulse=10_000.0 - 60 * 60), j)[0] == "done"   # exit status wins
+    # a fresh pulse with no heartbeat yet (long restore) is alive, not a boot hang
+    assert sup.decide(obs(now=13 * 60, t_start=0, ep_start=0, t_step=0, hb=None, t_pulse=13 * 60 - 30), j)[0] == "continue"
 
 
 def _state(tmp_path, name, episodes):
@@ -507,10 +509,12 @@ def test_failed_hosts_are_avoided_for_a_day(tmp_path):
     _state(tmp_path, "a", [ep(1, "no heartbeat 12 min after renting (status loading): boot hung", 1, machine=9),
                            ep(2, "instance exited (preempted?)", 1),                    # market, not the host
                            ep(3, "no heartbeat 12 min after renting: boot hung", 30),  # too old
-                           ep(4, "heartbeat unchanged for 12 min (phase data, step 0): box wedged", 2)])
+                           ep(4, "pulse unchanged for 12 min (phase data, step 0): box wedged", 2)])
     _state(tmp_path, "b", [ep(5, "no progress 40 min into the episode (phase data)", 3)])
-    bad = sup.failed_hosts(tmp_path, now=now)
-    assert bad == {("offer", 1), ("machine", 9), ("offer", 4), ("offer", 5)}
+    (tmp_path / "junk.json").write_text("{not json")                      # a peer's broken state: skipped
+    assert sup.failed_hosts(tmp_path, "a", now=now, out=lambda m: None) == {("offer", 1), ("machine", 9), ("offer", 4)}
+    # job b sees a's boot hang (global) but not a's wedge (job-scoped); its own no-progress counts
+    assert sup.failed_hosts(tmp_path, "b", now=now, out=lambda m: None) == {("offer", 1), ("machine", 9), ("offer", 5)}
 
 
 def test_provision_skips_failed_hosts(tmp_path):
@@ -554,3 +558,64 @@ def test_a_failed_destroy_is_retried_then_stops_and_is_retried_at_restart(tmp_pa
     sup.run(j2, p, v, s3, B2Creds("k", "s", "e"), "c", out=lambda m: None)
     st = json.loads((tmp_path / "t.json").read_text())
     assert 101 in v.destroyed and not st["episodes"][0]["destroy_pending"]
+
+
+def test_a_lost_rent_reply_is_adopted_by_label(tmp_path):
+    from cloudrun.vast import VastError
+
+    class V(FakeVast):
+        labels = {}
+
+        def rent(self, offer_id, body):
+            inst = super().rent(offer_id, body)
+            self.labels[inst] = body["label"]
+            raise VastError("timeout")          # the box exists but the reply never came
+
+        def instances(self):
+            return [{"id": i, "actual_status": "running", "label": self.labels.get(i)} for i in self.live]
+    v = V([["running"]])
+    p = Project(bucket="b", b2_env="", vast_env="", repo="o/r", state_dir=str(tmp_path))
+    st = sup.State(tmp_path / "t.json", "t")
+    inst, e = sup.provision(job(), p, v, B2Creds("k", "s", "e"), "c", 0, lambda m: None, st=st)
+    assert inst == 101 and st.d["episodes"][0]["instance"] == 101 and st.d["renting"] is None
+    assert len(v.rented) == 1                    # did not rent a second box
+
+
+def test_recover_destroys_an_unrecorded_rent_and_applies_a_saved_done(tmp_path):
+    class V(FakeVast):
+        def instances(self):
+            return [{"id": i, "actual_status": "running", "label": "cloudrun:t:ep1:x" if i == 77 else None}
+                    for i in self.live]
+    v = V([])
+    v.live[77] = ["running"]
+    v.live[55] = ["running"]
+    now = time.time()
+    (tmp_path / "t.json").write_text(json.dumps({"job": "t", "spent": 0.0, "failures": 0, "outcome": None,
+        "renting": {"label": "cloudrun:t:ep1:x", "offer": 7, "rate": 0.3, "od": False, "time": now - 60},
+        "episodes": [{"n": 0, "instance": 55, "rate": 0.3, "start": now - 3600, "end": None, "end_reason": None,
+                      "max_step": 600, "destroy_pending": True, "pending_action": "done",
+                      "pending_reason": "job exited 0"}]}))
+    p = Project(bucket="b", b2_env="", vast_env="", repo="o/r", state_dir=str(tmp_path))
+    out = sup.run(job(watch=Watch(poll_s=0)), p, v, FakeS3(), B2Creds("k", "s", "e"), "c", out=lambda m: None)
+    st = json.loads((tmp_path / "t.json").read_text())
+    assert out == "done" and set(v.destroyed) == {55, 77} and v.rented == []
+    assert all(e["end"] and not e["destroy_pending"] for e in st["episodes"]) and st["spent"] > 0.29
+
+
+def test_a_vast_outage_still_enforces_the_spend_cap(tmp_path, monkeypatch):
+    from cloudrun.vast import VastError
+
+    class V(FakeVast):
+        def poll(self, inst):
+            raise VastError("DNS down")
+    v = V([["running"]])
+    j = job(budget=Budget(max_spend=0.5, max_hours=10), watch=Watch(poll_s=0))
+    p = Project(bucket="b", b2_env="", vast_env="", repo="o/r", state_dir=str(tmp_path))
+    clock = {"t": 1_000_000.0}
+
+    def fake_time():
+        clock["t"] += 3600        # an hour per call: the running cost passes the cap within a few polls
+        return clock["t"]
+    monkeypatch.setattr(sup.time, "time", fake_time)
+    out = sup.run(j, p, v, FakeS3(), B2Creds("k", "s", "e"), "c", out=lambda m: None)
+    assert out.startswith("stop") and "spend cap" in out and v.destroyed == [101]

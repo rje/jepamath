@@ -12,8 +12,8 @@ Rules (in order):
   heartbeat exit_rc != 0 otherwise                             -> replace (counts as a failure)
   instance not listed / not in a running state                 -> replace (preemption; not a failure)
   started this episode, step unchanged for watch.stall_min     -> replace (failure: a wedged box bills too)
-  no heartbeat at all, episode older than watch.boot_min       -> replace (failure: image pull / boot hung)
-  heartbeat unchanged for watch.hb_stale_min, no exit status   -> replace (failure: box wedged in any phase)
+  no heartbeat and no pulse, episode older than watch.boot_min -> replace (failure: image pull / boot hung)
+  pulse seen, then unchanged for watch.hb_stale_min            -> replace (failure: box frozen or offline)
   not started, episode older than watch.setup_grace_min        -> replace (failure)
   failures > watch.max_failures                                -> stop
 """
@@ -25,6 +25,7 @@ import dataclasses as dc
 import json
 import signal
 import time
+import uuid
 from pathlib import Path
 
 from . import b2
@@ -45,7 +46,7 @@ class Obs:
     spent: float                # banked + running episode
     any_progress: bool          # some episode (including this one) reached step > 0
     failures: int
-    t_hb: float | None = None   # local time the heartbeat content last changed (None: no heartbeat yet)
+    t_pulse: float | None = None  # local time the liveness pulse last changed (None: never seen; cloudrun.pulse)
 
 
 def decide(o: Obs, job: Job) -> tuple[str, str]:
@@ -64,13 +65,14 @@ def decide(o: Obs, job: Job) -> tuple[str, str]:
         return "replace_failure", f"job failed rc={rc} in phase {o.hb.get('phase')}"
     if o.status is None or o.status not in RUNNING_STATES:
         return "replace", f"instance {o.status or 'gone'} (preempted?)"
-    if o.hb is not None and o.t_hb is not None and (o.now - o.t_hb) / 60 > w.hb_stale_min:
-        return "replace_failure", (f"heartbeat unchanged for {w.hb_stale_min} min "
-                                   f"(phase {o.hb.get('phase')}, step {o.ep_step}): box wedged")
+    if o.t_pulse is not None and (o.now - o.t_pulse) / 60 > w.hb_stale_min:
+        phase = (o.hb or {}).get("phase", "no heartbeat")
+        return "replace_failure", (f"pulse unchanged for {w.hb_stale_min} min (phase {phase}, step {o.ep_step}): "
+                                   f"box wedged")
     if o.ep_step > 0:
         if (o.now - o.t_step) / 60 > w.stall_min:
             return "replace_failure", f"stalled: step {o.ep_step} unchanged for {w.stall_min} min"
-    elif o.hb is None and (o.now - o.ep_start) / 60 > w.boot_min:
+    elif o.hb is None and o.t_pulse is None and (o.now - o.ep_start) / 60 > w.boot_min:
         return "replace_failure", f"no heartbeat {w.boot_min} min after renting (status {o.status}): boot hung"
     elif (o.now - o.ep_start) / 60 > w.setup_grace_min:
         phase = (o.hb or {}).get("phase", "no heartbeat")
@@ -119,19 +121,8 @@ s3.put_object(Bucket=e["CLOUDRUN_BUCKET"], Key=key,
 PY
   exit 94
 fi
-# early heartbeat: the box booted and fetched the code. The syncer refreshes it every minute once restore is
-# done, so a box wedged between here and there shows up as a stale heartbeat (decide: hb_stale_min).
-python - <<'PY' || echo "early heartbeat failed (the syncer's will follow)"
-import boto3, json, os, time
-e = os.environ
-s3 = boto3.client("s3", endpoint_url=e["CLOUDRUN_B2_ENDPOINT"], aws_access_key_id=e["CLOUDRUN_B2_KEY_ID"],
-                  aws_secret_access_key=e["CLOUDRUN_B2_APPLICATION_KEY"])
-ep = int(e["CLOUDRUN_EPISODE"])
-root = e.get("CLOUDRUN_ROOT", "").strip("/")
-key = "/".join(p for p in (root, "runs", e["CLOUDRUN_JOB"], "heartbeat", f"ep{ep:03d}.json") if p)
-s3.put_object(Bucket=e["CLOUDRUN_BUCKET"], Key=key,
-              Body=json.dumps({"episode": ep, "time": time.time(), "phase": "booted", "step": 0, "exit_rc": None}))
-PY
+# liveness pulse for the life of the box, independent of uploads (cloudrun.pulse; decide: hb_stale_min)
+(cd $WORK/code/src && PYTHONPATH=$WORK/code/src nohup python -m cloudrun.pulse > $WORK/pulse.log 2>&1 &)
 exec bash $WORK/code/src/cloudrun/bootstrap.sh
 """
 
@@ -171,32 +162,90 @@ def heartbeat(s3, project: Project, job: str, ep: int) -> dict | None:
     return json.loads(r[0]) if r else None
 
 
+def pulse(s3, project: Project, job: str, ep: int) -> float | None:
+    """The instance's liveness pulse time (cloudrun.pulse), None before the first one."""
+    r = b2.get_bytes(s3, project.bucket, project.key("runs", job, "pulse", f"ep{ep:03d}.json"))
+    return json.loads(r[0]).get("time") if r else None
+
+
 class _Terminate(Exception):
     pass
 
 
+class DestroyFailed(RuntimeError):
+    pass
+
+
+class NoOffers(RuntimeError):
+    pass
+
+
+_GUARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+class _signals_deferred:
+    """Block SIGINT/SIGTERM/SIGHUP for a bounded critical section (rent + ledger write, destroy + ledger
+    write). A signal that arrives meanwhile is delivered on exit, so the section always completes."""
+
+    def __enter__(self):
+        self.old = signal.pthread_sigmask(signal.SIG_BLOCK, _GUARDED)
+
+    def __exit__(self, *_):
+        signal.pthread_sigmask(signal.SIG_SETMASK, self.old)
+        return False
+
+
+def recover(st: "State", vast: Vast, out) -> str | None:
+    """Close every episode a previous supervisor left open: the box was rented but never confirmed destroyed
+    (orphaned, or destroy_pending after failed destroys), or a rent whose reply was lost (st.d["renting"],
+    found by its label). Runs before anything else at launch. If a saved decision says the job was done or
+    stopped, that outcome is returned and nothing new is rented."""
+    pend = st.d.get("renting")
+    if pend:
+        known = {e["instance"] for e in st.d["episodes"]}
+        found = [i for i in vast.instances() if i.get("label") == pend["label"] and i.get("id") not in known]
+        for i in found:
+            out(f"rent {pend['label']} (offer {pend['offer']}) reached Vast as instance {i['id']} but was never "
+                f"recorded: adding it to the ledger and destroying it")
+            st.d["episodes"].append({"n": len(st.d["episodes"]), "instance": i["id"], "rate": pend["rate"],
+                                     "on_demand": pend["od"], "offer": pend["offer"], "machine": pend.get("machine"),
+                                     "start": pend["time"], "end": None, "end_reason": None, "max_step": 0,
+                                     "commit": pend.get("commit"), "label": pend["label"]})
+        st.d["renting"] = None
+        st.save()
+    outcome = None
+    for e in st.d["episodes"]:
+        if e["end"] is None:
+            action = e.get("pending_action")
+            reason = e.get("pending_reason") or "orphaned by a previous supervisor"
+            out(f"episode {e['n']} (instance {e['instance']}) was left open ({reason}); destroying it")
+            _end_episode(st, e, vast, e["instance"], reason, out, action)
+            if action in ("done", "stop"):
+                outcome = f"{action}: {reason}"
+    if outcome:
+        st.d["outcome"] = "done" if outcome.startswith("done") else outcome
+        st.save()
+    return outcome
+
+
 def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str, out=print) -> str:
     """Supervise until done/stop. Returns the outcome string. The current instance is destroyed on every exit
-    path, including SIGTERM/SIGHUP (converted to an exception so `finally` runs)."""
+    path, including SIGTERM/SIGHUP (converted to an exception so `finally` runs); destroys and rents run with
+    those signals deferred so a signal cannot cut one off between Vast and the ledger."""
     st = State(project.path(project.state_dir) / f"{job.name}.json", job.name)
     if st.d.get("outcome") == "done":
         raise RuntimeError(f"{job.name} is already done (state {st.path}); use a new job name to rerun")
     st.d["outcome"] = None
+    prior = recover(st, vast, out)
+    if prior:
+        out(f"{job.name}: {prior} (decided before the previous supervisor's destroy failed)")
+        return st.d["outcome"]
     any_progress = any(e.get("max_step", 0) > 0 for e in st.d["episodes"])
-    # an episode left open by a supervisor that died: its box may still be billing
-    for e in st.d["episodes"]:
-        if e.get("destroy_pending"):
-            out(f"episode {e['n']} (instance {e['instance']}): destroy was pending; retrying")
-            _end_episode(st, e, vast, e["instance"], e.get("end_reason") or "destroy pending", out)
-    for e in st.d["episodes"]:
-        if e["end"] is None:
-            out(f"episode {e['n']} (instance {e['instance']}) was left open by a previous supervisor")
-            _end_episode(st, e, vast, e["instance"], "orphaned by a previous supervisor", out)
 
     def _sig(signum, _frame):
         raise _Terminate(f"signal {signum}")
-    for s in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(s, _sig)
+    for s_ in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s_, _sig)
 
     t_start = time.time()
     inst = ep = None
@@ -210,39 +259,48 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
                 if st.d["spent"] >= job.budget.max_spend:
                     outcome = f"stop: spend cap ${st.d['spent']:.2f}"
                     break
+                if (time.time() - t_start) / 3600 > job.budget.max_hours:
+                    outcome = f"stop: wall-clock cap {job.budget.max_hours} h"
+                    break
                 ep = len(st.d["episodes"])
-                avoid = failed_hosts(project.path(project.state_dir))
-                inst, rate, od, offer = provision(job, project, vast, creds, commit, ep, out,
-                                                  data_gb(job, project, s3), avoid)
-                e = {"n": ep, "instance": inst, "rate": rate, "on_demand": od, "offer": offer["id"],
-                     "machine": offer.get("machine_id"),
-                     "gpu": offer.get("gpu_name"), "geo": offer.get("geolocation"), "start": time.time(),
-                     "end": None, "end_reason": None, "max_step": 0, "commit": commit}
-                st.d["episodes"].append(e)
-                st.save()
+                try:
+                    inst, e = provision(job, project, vast, creds, commit, ep, out, data_gb(job, project, s3),
+                                        failed_hosts(project.path(project.state_dir), job.name, out=out), st)
+                except NoOffers as ex:
+                    out(f"  {ex}; looking again in {NO_OFFER_WAIT_S // 60} min")
+                    time.sleep(NO_OFFER_WAIT_S)
+                    continue
                 ep_step, t_step = 0, e["start"]
-                hb_last, t_hb = None, None
+                pulse_last, t_pulse = None, None
             time.sleep(job.watch.poll_s)
             now = time.time()
             try:
                 status, billed, bw = vast.poll(inst)
-            except VastError as ex:          # an API hiccup is not evidence the box died; look again next poll
-                out(f"  vast API error (ignored this poll): {ex}")
-                continue
+            except VastError as ex:
+                # an API hiccup is not evidence the box died; look again next poll. The caps still hold:
+                # judged from local time and the last known rate, so an outage cannot bill forever.
+                running = e["rate"] * (now - e["start"]) / 3600 + e.get("bandwidth", 0.0)
+                over = (st.d["spent"] + running >= job.budget.max_spend
+                        or (now - t_start) / 3600 > job.budget.max_hours)
+                out(f"  vast API error ({ex})" + ("; a cap is reached: tearing down" if over else "; ignored this poll"))
+                if not over:
+                    continue
+                status, billed, bw = "unknown", None, e.get("bandwidth", 0.0)
             if billed is not None and billed > e["rate"]:   # account at what Vast bills, never below the bid
                 e["rate"] = billed
             e["bandwidth"] = max(e.get("bandwidth", 0.0), bw)
             hb = heartbeat(s3, project, job.name, ep)
-            if hb is not None and hb.get("time") != hb_last:
-                hb_last, t_hb = hb.get("time"), now
+            pt = pulse(s3, project, job.name, ep)
+            if pt is not None and pt != pulse_last:
+                pulse_last, t_pulse = pt, now
             if hb and hb.get("step", 0) > ep_step:
                 ep_step, t_step = hb["step"], now
                 e["max_step"] = ep_step
                 any_progress = True
             running = e["rate"] * (now - e["start"]) / 3600 + e.get("bandwidth", 0.0)
-            o = Obs(now=now, t_start=t_start, ep_start=e["start"], status=status, hb=hb, ep_step=ep_step,
-                    t_step=t_step, spent=st.d["spent"] + running, any_progress=any_progress,
-                    failures=st.d["failures"], t_hb=t_hb)
+            o = Obs(now=now, t_start=t_start, ep_start=e["start"], status=status if status != "unknown" else "running",
+                    hb=hb, ep_step=ep_step, t_step=t_step, spent=st.d["spent"] + running, any_progress=any_progress,
+                    failures=st.d["failures"], t_pulse=t_pulse)
             action, reason = decide(o, job)
             phase = (hb or {}).get("phase", "-")
             out(f"  [ep{ep} {(now - e['start']) / 60:5.0f}m] {status or 'gone':<8} phase {phase:<8} step {ep_step:>7} "
@@ -251,15 +309,12 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
             if action == "continue":
                 continue
             try:
-                _end_episode(st, e, vast, inst, reason, out)
+                _end_episode(st, e, vast, inst, reason, out, action)
             finally:
-                inst = None          # never retried again in `finally` below; destroy_pending carries it
+                inst = None          # never destroyed again below; an open episode / destroy_pending carries it
             if action in ("done", "stop"):
                 outcome = f"{action}: {reason}"
                 break
-            if action == "replace_failure":
-                st.d["failures"] += 1
-            st.save()
     except DestroyFailed as ex:
         outcome = f"stopped: {ex}"
     except _Terminate as ex:
@@ -289,57 +344,74 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
 
 
 DESTROY_TRIES, DESTROY_WAIT_S = 6, 30
+NO_OFFER_WAIT_S = 300
 
 
-def _end_episode(st: State, e: dict, vast: Vast, inst: int, reason: str, out) -> None:
-    """Destroy the box, retrying (DNS and API outages have hit both poll and destroy before; one failed
-    destroy once left a box billing for 12 h). If every try fails, the episode is marked destroy_pending
-    (retried at the next supervisor start) and the supervisor stops renting by raising."""
-    out(f"  destroying {inst} ({reason})")
-    err = None
-    for i in range(DESTROY_TRIES):
-        try:
-            vast.destroy(inst)
-            out("  destroyed (verified)")
-            err = None
-            break
-        except VastError as ex:
-            err = ex
-            out(f"  destroy attempt {i + 1}/{DESTROY_TRIES} failed: {ex}")
-            if i + 1 < DESTROY_TRIES:
-                time.sleep(DESTROY_WAIT_S)
-    if e["end"] is None:
-        e["end"] = time.time()
-        e["end_reason"] = reason
-        st.d["spent"] += e["rate"] * (e["end"] - e["start"]) / 3600 + e.get("bandwidth", 0.0)
-    e["destroy_pending"] = err is not None
-    st.save()
-    if err is not None:
-        raise DestroyFailed(f"instance {inst} could not be destroyed after {DESTROY_TRIES} tries ({err}): it may "
-                            f"still be billing. Kill it at https://cloud.vast.ai/instances/ ; the next supervisor "
-                            f"start retries it")
+def _end_episode(st: State, e: dict, vast: Vast, inst: int, reason: str, out, action: str | None = None) -> None:
+    """Destroy the box, then close the episode in the ledger, with signals deferred throughout.
 
-
-class DestroyFailed(RuntimeError):
-    pass
+    The decision (`action`, `reason`) is saved with destroy_pending BEFORE the first DELETE. On success the
+    episode's end is set now, so its spend runs to the verified destroy, and a replace_failure counts once. If
+    all DESTROY_TRIES fail, the episode stays open (end None: still billing) and DestroyFailed is raised; the next
+    supervisor start (recover) retries it and applies the saved decision."""
+    with _signals_deferred():
+        e["destroy_pending"], e["pending_action"], e["pending_reason"] = True, action, reason
+        st.save()
+        out(f"  destroying {inst} ({reason})")
+        err = None
+        for i in range(DESTROY_TRIES):
+            try:
+                vast.destroy(inst)
+                out("  destroyed (verified)")
+                err = None
+                break
+            except VastError as ex:
+                err = ex
+                out(f"  destroy attempt {i + 1}/{DESTROY_TRIES} failed: {ex}")
+                if i + 1 < DESTROY_TRIES:
+                    time.sleep(DESTROY_WAIT_S)
+        if err is not None:
+            st.save()
+            raise DestroyFailed(f"instance {inst} could not be destroyed after {DESTROY_TRIES} tries ({err}): it may "
+                                f"still be billing. Kill it at https://cloud.vast.ai/instances/ ; the next "
+                                f"supervisor start retries it")
+        if e["end"] is None:
+            e["end"] = time.time()
+            e["end_reason"] = reason
+            st.d["spent"] += e["rate"] * (e["end"] - e["start"]) / 3600 + e.get("bandwidth", 0.0)
+        if action == "replace_failure":
+            st.d["failures"] += 1
+        e["destroy_pending"] = False
+        st.save()
 
 
 FAILED_HOST_HOURS = 24.0
 
 
-def failed_hosts(state_dir: Path, now: float | None = None, hours: float = FAILED_HOST_HOURS) -> set:
-    """Offer and machine ids (as ("offer", id) / ("machine", id)) that, in any job's state within `hours`,
-    hung at boot, made no progress within the setup grace, or wedged (stale heartbeat). Renting the same host again right after
-    such a failure was 11 of 43 boot hangs (26 Nov audit)."""
+def failed_hosts(state_dir: Path, job: str, now: float | None = None, hours: float = FAILED_HOST_HOURS,
+                 out=print) -> set:
+    """Hosts not to rent, as ("offer", id) / ("machine", id), from episodes that ended within `hours`:
+    - boot hung (no sign of life at all: image pull or the box itself), from ANY job's state;
+    - wedged (pulse stopped) or no progress within the setup grace, from THIS job's state only, since a slow
+      dataset or a B2 outage can cause those on a healthy host.
+    Preemptions never count (the market, not the host). An unreadable peer state file is skipped with a
+    warning; this job's own must parse. Renting the same host straight after a hang was 11 of 43 boot hangs."""
     now = time.time() if now is None else now
     bad = set()
     for f in Path(state_dir).glob("*.json"):
-        for e in json.loads(f.read_text()).get("episodes", []):
+        own = f.stem == job
+        try:
+            eps = json.loads(f.read_text()).get("episodes", [])
+        except (json.JSONDecodeError, OSError) as ex:
+            if own:
+                raise
+            out(f"  warning: skipping unreadable state {f.name} ({ex})")
+            continue
+        for e in eps:
             r = e.get("end_reason") or ""
             if e.get("end") is None or now - e["end"] > hours * 3600:
                 continue
-            # host faults only: a preemption is the market outbidding us, not the box failing
-            if "boot hung" in r or "wedged" in r or "no progress" in r:
+            if "boot hung" in r or (own and ("wedged" in r or "no progress" in r)):
                 bad.add(("offer", e.get("offer")))
                 if e.get("machine") is not None:
                     bad.add(("machine", e["machine"]))
@@ -353,7 +425,11 @@ def data_gb(job, project, s3) -> float:
 
 
 def provision(job: Job, project: Project, vast: Vast, creds: B2Creds, commit: str, ep: int, out,
-              down_gb: float = 0.0, avoid: set = frozenset()):
+              down_gb: float = 0.0, avoid: set = frozenset(), st: State | None = None):
+    """Rent the cheapest eligible offer not on a failed host. With a ledger (`st`), the rent runs with
+    signals deferred and is recorded in st.d["renting"] (label, offer) BEFORE the request, then as an episode
+    after it; a rent whose reply is lost is looked up by its label before trying the next offer. Returns
+    (instance, episode dict) with a ledger, else (instance, rate, on_demand, offer)."""
     m = job.machine
     ranked = rank(vast.search_all(m), m, down_gb)
     n0 = len(ranked)
@@ -361,25 +437,53 @@ def provision(job: Job, project: Project, vast: Vast, creds: B2Creds, commit: st
     if n0 != len(ranked):
         out(f"  skipping {n0 - len(ranked)} offer(s) on hosts that failed in the last {FAILED_HOST_HOURS:.0f} h")
     if n0 and not ranked:
-        raise RuntimeError(f"all {n0} eligible offers are on hosts that failed in the last {FAILED_HOST_HOURS:.0f} h")
+        raise NoOffers(f"all {n0} eligible offers are on hosts that failed in the last {FAILED_HOST_HOURS:.0f} h")
     if not ranked:
-        raise RuntimeError(f"no offer for {m.gpus} at <= ${m.max_price_per_gpu}/GPU-h passes the filters")
+        raise NoOffers(f"no offer for {m.gpus} at <= ${m.max_price_per_gpu}/GPU-h passes the filters")
     out(fmt_offers(ranked, 5, m=m, down_gb=down_gb))
     env = instance_env(job, project, creds, commit, ep)
     for rate, od, offer in ranked[:5]:
         # re-check the cap against the offer as rented, not as first listed
         if rate > m.max_price_per_gpu * m.num_gpus:
             raise RuntimeError(f"rate {rate} over cap — refusing")
+        label = f"cloudrun:{job.name}:ep{ep}:{uuid.uuid4().hex[:8]}"
         body = {"client_id": "me", "image": m.image, "disk": m.min_disk_gb, "onstart": onstart_script(),
-                "env": env, "runtype": "ssh"}
+                "env": env, "runtype": "ssh", "label": label}
         if not od:
             body["price"] = rate        # a price makes the contract interruptible
-        try:
-            inst = vast.rent(offer["id"], body)
-        except VastError as ex:
-            out(f"  rent of offer {offer['id']} failed ({ex}); trying the next")
-            continue
-        out(f"episode {ep}: rented {inst} at ${rate:.3f}/h ({'on-demand' if od else 'interruptible'}) "
-            f"{offer.get('gpu_name')} {offer.get('geolocation')}")
-        return inst, rate, od, offer
-    raise RuntimeError("could not rent any of the top 5 offers")
+        with _signals_deferred():
+            if st is not None:
+                st.d["renting"] = {"label": label, "offer": offer["id"], "machine": offer.get("machine_id"),
+                                   "rate": rate, "od": od, "time": time.time(), "commit": commit}
+                st.save()
+            try:
+                inst = vast.rent(offer["id"], body)
+            except VastError as ex:
+                inst = None
+                if st is not None:      # did it reach Vast anyway? (reply lost)
+                    try:
+                        hit = [i["id"] for i in vast.instances() if i.get("label") == label]
+                    except VastError as ex2:
+                        raise RuntimeError(f"rent of offer {offer['id']} failed ({ex}) and the instance list is "
+                                           f"unreachable ({ex2}): stopping; the next start reconciles label {label}")
+                    inst = hit[0] if hit else None
+                if inst is None:
+                    out(f"  rent of offer {offer['id']} failed ({ex}); trying the next")
+                    if st is not None:
+                        st.d["renting"] = None
+                        st.save()
+                    continue
+                out(f"  rent reply lost but instance {inst} exists with label {label}: adopting it")
+            out(f"episode {ep}: rented {inst} at ${rate:.3f}/h ({'on-demand' if od else 'interruptible'}) "
+                f"{offer.get('gpu_name')} {offer.get('geolocation')}")
+            if st is None:
+                return inst, rate, od, offer
+            e = {"n": ep, "instance": inst, "rate": rate, "on_demand": od, "offer": offer["id"],
+                 "machine": offer.get("machine_id"), "label": label, "gpu": offer.get("gpu_name"),
+                 "geo": offer.get("geolocation"), "start": st.d["renting"]["time"], "end": None, "end_reason": None,
+                 "max_step": 0, "commit": commit}
+            st.d["episodes"].append(e)
+            st.d["renting"] = None
+            st.save()
+            return inst, e
+    raise NoOffers("could not rent any of the top 5 offers")

@@ -64,11 +64,20 @@ Of the $112.59 spent over 215 episodes, $14.84 went to boxes that never trained.
 - **Failed hosts are skipped for 24 h.** The supervisor reads every job's state and does not rent an offer or
   machine that hung at boot, made no progress within the setup grace, or wedged
   (`supervisor.failed_hosts`). Preemptions don't count, since they are the market rather than the host.
-- **Early heartbeat and stale-heartbeat rule.** onstart publishes a `booted` heartbeat right after the code
-  fetch. After that, a heartbeat whose content is unchanged for `watch.hb_stale_min` (default 12) means a wedged
-  box in any phase (restore, setup, data, run). The syncer rewrites the heartbeat every minute.
-- **Destroy is retried.** It gets 6 tries, 30 s apart. If all fail, the episode is marked `destroy_pending`, the
-  supervisor stops renting, and the next supervisor start retries the destroy.
+- **Liveness pulse.** onstart starts `cloudrun.pulse` right after the code fetch. It writes
+  `runs/<job>/pulse/epNNN.json` every minute for the life of the box, independent of uploads and of the job's
+  phase. A pulse that has been seen and then stays unchanged for `watch.hb_stale_min` (12) means the box is
+  frozen or offline. A box with neither heartbeat nor pulse after `boot_min` hung at boot.
+- **Host cooldown.** Boot hangs exclude the host for every job. Wedges and no-progress timeouts exclude it for
+  the same job only, since a slow dataset or a B2 outage can cause them on a healthy host.
+- **Destroy is retried.** It gets 6 tries, 30 s apart, with signals deferred. The decision is saved before
+  the first DELETE. If all tries fail, the episode stays open (still billing, still accounted), and the next
+  launch closes it before any precheck (`supervisor.recover`). It then applies the saved decision, so a job
+  that had finished is not rerun.
+- **Rents are labelled and recorded before the request.** A rent whose reply is lost is found by its label and
+  adopted rather than doubled. If a crash happens in between, the next launch destroys the box.
+- **Vast API outages no longer suspend the caps.** Spend and wall clock are judged from local time and the last
+  known rate.
 - **Inline evals.** Endpoint-focused 30k jobs pass `--eval-every 15000`, which evaluates at 0, 15k and 30k and
   saves weights there. That saves 8–11 min per run. The 500-step recovery checkpoints are unchanged. The evals
   use no RNG, so this does not change the training trajectory. Keep 2500 only where the eval curve is the

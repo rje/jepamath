@@ -82,3 +82,12 @@ Of the $112.59 spent over 215 episodes, $14.84 went to boxes that never trained.
   saves weights there. That saves 8–11 min per run. The 500-step recovery checkpoints are unchanged. The evals
   use no RNG, so this does not change the training trajectory. Keep 2500 only where the eval curve is the
   measurement.
+
+### Known limits (accepted after four Astra validation rounds, 26 Nov)
+
+- **Watchdogs during data pulls and post-evals.** A data pull longer than `setup_grace_min`, or a post-training eval longer than `stall_min`, is replaced as a failure. Size those settings per job.
+- **Same-size changed artifacts.** At boot, the syncer treats restored files of the same size as already shipped. A file changed after restore without changing size could be skipped.
+- **Missing `actual_status` counts as alive.** A listed instance with no `actual_status` is treated as alive, because Vast reports null while creating a box. The `boot_min` and `setup_grace_min` rules bound it.
+- **Destroy gives up after 12 tries.** The supervisor stops after 2 rounds of 6 tries, about 6 minutes. The box stays open in the ledger, and the next `launch --yes` destroys it before anything else.
+- **Old-format records whose box is already gone.** Billing between the recorded end and the box's removal is not in the ledger. The episode is flagged `unbanked_gap` and a warning is printed; check the Vast billing page.
+- **Over-cap after done.** A box found and destroyed only at exit can put a finished job over its spend cap after the fact. The outcome stays `done`.

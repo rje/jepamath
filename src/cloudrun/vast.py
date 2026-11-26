@@ -25,6 +25,10 @@ API_V1 = "https://console.vast.ai/api/v1"
 RUNNING_STATES = frozenset({"running", "loading", "created", "starting"})
 
 
+# rent replies that mean Vast did not allocate anything (allowlist: any other failure may have allocated a box)
+REFUSALS = frozenset({"no_such_ask"})
+
+
 class VastError(RuntimeError):
     """`code` is the HTTP status when Vast answered (a 4xx is a definite refusal), None for a network failure
     or an unexpected reply, where the request may or may not have taken effect."""
@@ -79,7 +83,7 @@ class Vast:
         if not inst:
             # {"success": false, "error": "no_such_ask", ...} is an explicit refusal; any other reply without a
             # contract is ambiguous and the supervisor reconciles it by label
-            raise VastError(f"create failed: {r}", refused=r.get("success") is False and bool(r.get("error")))
+            raise VastError(f"create failed: {r}", refused=r.get("success") is False and r.get("error") in REFUSALS)
         return int(inst)
 
     def instances(self) -> list[dict]:

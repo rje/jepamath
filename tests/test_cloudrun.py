@@ -883,3 +883,69 @@ def test_a_peer_episode_with_a_bad_end_is_skipped(tmp_path):
     _state(tmp_path, "peer", [{"n": 0, "end": "yesterday", "end_reason": "boot hung"}])
     _state(tmp_path, "a", [])
     assert sup.failed_hosts(tmp_path, "a", out=lambda m: None) == set()
+
+
+# ---------- 26 Nov, Astra's fourth validation of 107d7ff ----------
+
+def test_an_unreadable_pulse_is_no_evidence_of_a_boot_hang_or_wedge():
+    j = job(watch=Watch(hb_stale_min=12, boot_min=12, setup_grace_min=40))
+    o = obs(now=13 * 60, t_start=0, ep_start=0, t_step=0, hb=None, t_pulse=None, pulse_unread=True)
+    assert sup.decide(o, j)[0] == "continue"
+    o = obs(hb={"phase": "data", "step": 0, "exit_rc": None}, t_pulse=10_000.0 - 30 * 60, t_hb=10_000.0 - 30 * 60,
+            pulse_unread=True)
+    assert sup.decide(o, j)[0] == "continue"
+
+
+def test_only_allowlisted_refusals_are_definite():
+    from cloudrun.vast import Vast, VastError
+
+    class V(Vast):
+        def call(self, *a, **k):
+            return {"success": False, "error": "upstream_timeout"}
+    with pytest.raises(VastError) as ei:
+        V("k").rent(7, {})
+    assert not ei.value.definite
+
+
+def test_late_adoption_uses_the_billed_rate_and_clears_the_pending_rent(tmp_path):
+    v = FakeVast([])
+    v.live[77] = ["running"]
+    v.instances = lambda: [{"id": 77, "actual_status": "running", "label": "L", "dph_total": 0.9,
+                            "inet_down_billed": 0, "inet_up_billed": 0}]
+    st = sup.State(tmp_path / "t.json", "t")
+    st.d["renting"] = {"label": "L", "offer": 7, "rate": 0.3, "od": False, "time": time.time() - 3600, "ep": 0}
+    new = sup._adopt_late(st, v, lambda m: None)
+    assert new[0]["rate"] == 0.9 and st.d["renting"] is None
+    assert json.loads((tmp_path / "t.json").read_text())["renting"] is None
+
+
+def test_episode_numbers_are_never_reused_after_an_unresolved_rent(tmp_path):
+    v = FakeVast([["running"]])
+    st = sup.State(tmp_path / "t.json", "t")
+    st.d["next_ep"] = 3                  # ep0-2 were attempted (one lost) before
+    inst, e = sup.provision(job(), _p(tmp_path), v, B2Creds("k", "s", "e"), "c", 0, lambda m: None, st=st)
+    assert e["n"] == 3 and v.rented[0][1]["env"]["CLOUDRUN_EPISODE"] == "3" and st.d["next_ep"] == 4
+
+
+def test_a_listing_error_before_renting_retries_instead_of_stopping(tmp_path, monkeypatch):
+    from cloudrun.vast import VastError
+    monkeypatch.setattr(sup, "NO_OFFER_WAIT_S", 0)
+    s3 = FakeS3()
+
+    class V(FakeVast):
+        n = 0
+
+        def search_all(self, m):
+            self.n += 1
+            if self.n == 1:
+                raise VastError("DNS down")
+            return super().search_all(m)
+    s3.put_object("b", "runs/t/heartbeat/ep000.json", json.dumps({"episode": 0, "step": 600, "exit_rc": 0, "phase": "done", "time": 1}))
+    out = sup.run(job(watch=Watch(poll_s=0)), _p(tmp_path), V([["running"]]), s3, B2Creds("k", "s", "e"), "c", out=lambda m: None)
+    assert out == "done"
+
+
+def test_malformed_host_ids_are_ignored(tmp_path):
+    _state(tmp_path, "peer", [{"n": 0, "offer": 5, "machine": [], "end": time.time(), "end_reason": "boot hung"}])
+    _state(tmp_path, "a", [])
+    assert sup.failed_hosts(tmp_path, "a", out=lambda m: None) == {("offer", 5)}

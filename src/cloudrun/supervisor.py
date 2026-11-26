@@ -33,7 +33,7 @@ from pathlib import Path
 from . import b2
 from .config import Job, Project
 from .creds import B2Creds
-from .vast import RUNNING_STATES, Vast, VastError, fmt_offers, rank
+from .vast import RUNNING_STATES, Vast, VastError, bandwidth_usd, fmt_offers, rank
 
 
 @dc.dataclass
@@ -50,6 +50,7 @@ class Obs:
     failures: int
     t_pulse: float | None = None  # local time the liveness pulse last changed (None: never seen; cloudrun.pulse)
     t_hb: float | None = None     # local time the syncer heartbeat's `time` last changed (None: never seen)
+    pulse_unread: bool = False    # the pulse GET failed this poll: no boot-hang / wedge decision rests on it
 
 
 def decide(o: Obs, job: Job) -> tuple[str, str]:
@@ -68,7 +69,7 @@ def decide(o: Obs, job: Job) -> tuple[str, str]:
         return "replace_failure", f"job failed rc={rc} in phase {o.hb.get('phase')}"
     if o.status is None or o.status not in RUNNING_STATES:
         return "replace", f"instance {o.status or 'gone'} (preempted?)"
-    if o.t_pulse is not None:
+    if o.t_pulse is not None and not o.pulse_unread:
         # any sign of life counts: the pulse, a fresh syncer heartbeat, or a new training step. Only when all of
         # them have been still for hb_stale_min is the box frozen or offline (a dead pulse process alone is not).
         signs = [t for t in (o.t_pulse, o.t_hb, o.t_step if o.ep_step > 0 else None) if t is not None]
@@ -79,7 +80,7 @@ def decide(o: Obs, job: Job) -> tuple[str, str]:
     if o.ep_step > 0:
         if (o.now - o.t_step) / 60 > w.stall_min:
             return "replace_failure", f"stalled: step {o.ep_step} unchanged for {w.stall_min} min"
-    elif o.hb is None and o.t_pulse is None and (o.now - o.ep_start) / 60 > w.boot_min:
+    elif o.hb is None and o.t_pulse is None and not o.pulse_unread and (o.now - o.ep_start) / 60 > w.boot_min:
         return "replace_failure", f"no heartbeat {w.boot_min} min after renting (status {o.status}): boot hung"
     elif (o.now - o.ep_start) / 60 > w.setup_grace_min:
         phase = (o.hb or {}).get("phase", "no heartbeat")
@@ -257,13 +258,18 @@ def _adopt_late(st: "State", vast: Vast, out, listing: list | None = None) -> li
             if i.get("label") == pend["label"] and i.get("id") not in known:
                 out(f"rent {pend['label']} (offer {pend['offer']}) reached Vast as instance {i['id']} but was never "
                     f"recorded: adding it to the ledger and destroying it")
-                e = {"n": len(st.d["episodes"]), "instance": i["id"], "rate": pend["rate"], "on_demand": pend["od"],
+                dph = i.get("dph_total")
+                e = {"n": len(st.d["episodes"]), "instance": i["id"],
+                     "rate": max(pend["rate"], float(dph) if dph is not None else 0.0),
+                     "bandwidth": bandwidth_usd(i), "on_demand": pend["od"],
                      "offer": pend["offer"], "machine": pend.get("machine"), "start": pend["time"], "end": None,
                      "end_reason": None, "max_step": 0, "commit": pend.get("commit"), "label": pend["label"]}
                 st.d["episodes"].append(e)
                 new.append(e)
                 known.add(i["id"])
                 pend["adopted"] = True
+    if st.d.get("renting") and st.d["renting"].get("adopted"):
+        st.d["renting"] = None          # reconciled: cleared in the same save that records the box
     st.d["late_labels"] = [p for p in st.d.get("late_labels", [])
                            if not p.get("adopted") and time.time() - p["time"] < LATE_LABEL_DAYS * 86400]
     st.save()
@@ -277,7 +283,7 @@ def recover(st: "State", vast: Vast, out) -> str | None:
     was done or stopped, that outcome is returned and nothing new is rented."""
     pend = st.d.get("renting")
     found = _adopt_late(st, vast, out)
-    if pend:
+    if pend and st.d.get("renting"):
         if not any(e["label"] == pend["label"] for e in found):
             if time.time() - pend["time"] < RENT_SETTLE_S:
                 raise RentUnresolved(f"a rent ({pend['label']}, offer {pend['offer']}) from "
@@ -293,7 +299,7 @@ def recover(st: "State", vast: Vast, out) -> str | None:
         # failed destroy): still possibly billing, so it is destroyed too, and only the unbanked time is added
         if e["end"] is None or e.get("destroy_pending"):
             action = e.get("pending_action")
-            if "pending_action" not in e and e.get("end") is not None:      # legacy: the decision is in end_reason
+            if action is None and e.get("end") is not None:      # legacy: the decision is in end_reason
                 r = e.get("end_reason") or ""
                 action = "done" if r == "job exited 0" else "stop" if r.startswith(_LEGACY_STOP) else None
             reason = e.get("pending_reason") or e.get("end_reason") or "orphaned by a previous supervisor"
@@ -347,6 +353,10 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
                                         failed_hosts(project.path(project.state_dir), job.name, out=out), st)
                 except NoOffers as ex:
                     out(f"  {ex}; looking again in {NO_OFFER_WAIT_S // 60} min")
+                    time.sleep(NO_OFFER_WAIT_S)
+                    continue
+                except VastError as ex:     # search or late-label listing failed before any rent: retry later
+                    out(f"  vast API error before renting ({ex}); trying again in {NO_OFFER_WAIT_S // 60} min")
                     time.sleep(NO_OFFER_WAIT_S)
                     continue
                 ep = e["n"]          # provision may have adopted late rents first, shifting the number
@@ -406,7 +416,8 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
                     o = Obs(now=now, t_start=t_start, ep_start=e["start"],
                             status="running" if status == "unknown" else status, hb=hb, ep_step=ep_step,
                             t_step=t_step, spent=st.d["spent"] + running, any_progress=any_progress,
-                            failures=st.d["failures"], t_pulse=t_pulse, t_hb=t_hb)
+                            failures=st.d["failures"], t_pulse=t_pulse, t_hb=t_hb,
+                            pulse_unread=pt_err is not None)
                     action, reason = decide(o, job)
                     phase = (hb or {}).get("phase", "-")
                     out(f"  [ep{ep} {(now - e['start']) / 60:5.0f}m] {status or 'gone':<8} phase {phase:<8} "
@@ -446,6 +457,10 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
                              e_.get("pending_action"))
             except DestroyFailed as ex:
                 outcome = f"stopped: {ex}"
+        still = [x["instance"] for x in st.d["episodes"] if x["end"] is None or x.get("destroy_pending")]
+        if still:
+            out(f"WARNING: instance(s) {still} could not be confirmed destroyed and may be billing; the next "
+                f"`launch --yes` destroys them before anything else")
         if st.d.get("outcome") is None:      # a done/stop already saved with its episode's closure stands
             st.d["outcome"] = "done" if outcome.startswith("done") else outcome
         st.save()
@@ -521,6 +536,9 @@ def _end_episode(st: State, e: dict, vast: Vast, inst: int, reason: str, out, ac
             e["end_reason"] = reason
         elif absent:
             e["end_reason"] = f"{e.get('end_reason')}; already gone at recovery (gap after end not billed here)"
+            e["unbanked_gap"] = True
+            out(f"  WARNING: instance {inst} was already gone; any billing between its recorded end and its "
+                f"removal is NOT in the ledger. Check the Vast billing page.")
         else:       # pre-c42068f destroy_pending, still listed: add only the time since the banked end
             st.d["spent"] += e["rate"] * (now - e["end"]) / 3600
             e["end_reason"] = f"{e.get('end_reason')}; destroy confirmed later"
@@ -571,9 +589,12 @@ def failed_hosts(state_dir: Path, job: str, now: float | None = None, hours: flo
             if now - e["end"] > hours * 3600:
                 continue
             if "boot hung" in r or (own and ("wedged" in r or "no progress" in r)):
-                bad.add(("offer", e.get("offer")))
-                if e.get("machine") is not None:
-                    bad.add(("machine", e["machine"]))
+                for kind in ("offer", "machine"):
+                    v = e.get(kind)
+                    if isinstance(v, int) and not isinstance(v, bool):
+                        bad.add((kind, v))
+                    elif v is not None:
+                        out(f"  warning: ignoring malformed {kind} id {v!r} in {f.name}")
     return bad
 
 
@@ -602,7 +623,8 @@ def provision(job: Job, project: Project, vast: Vast, creds: B2Creds, commit: st
     if st is not None:      # a rent that showed up late in the list is destroyed before another is made
         for late in _adopt_late(st, vast, out):
             _end_episode(st, late, vast, late["instance"], "late-listed rent adopted", out)
-        ep = len(st.d["episodes"])
+        # episode numbers are never reused, so a box whose rent was lost cannot share heartbeat keys with a new one
+        ep = max(len(st.d["episodes"]), st.d.get("next_ep", 0))
     out(fmt_offers(ranked, 5, m=m, down_gb=down_gb))
     env = instance_env(job, project, creds, commit, ep)
     for rate, od, offer in ranked[:5]:
@@ -617,7 +639,8 @@ def provision(job: Job, project: Project, vast: Vast, creds: B2Creds, commit: st
         with _signals_deferred():
             if st is not None:
                 st.d["renting"] = {"label": label, "offer": offer["id"], "machine": offer.get("machine_id"),
-                                   "rate": rate, "od": od, "time": time.time(), "commit": commit}
+                                   "rate": rate, "od": od, "time": time.time(), "commit": commit, "ep": ep}
+                st.d["next_ep"] = ep + 1
                 st.save()
             try:
                 inst = vast.rent(offer["id"], body)
@@ -628,7 +651,7 @@ def provision(job: Job, project: Project, vast: Vast, creds: B2Creds, commit: st
                 # not proof. Look it up by label a few times; still absent -> stop rather than rent a second box.
                 definite = ex.definite
                 if st is not None:
-                    for k in range(1 if definite else RENT_LOOKUP_TRIES):
+                    for k in range(0 if definite else RENT_LOOKUP_TRIES):
                         try:
                             hit = [i["id"] for i in vast.instances() if i.get("label") == label]
                         except VastError as ex2:

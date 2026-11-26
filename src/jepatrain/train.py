@@ -199,6 +199,12 @@ def main():
     ap.add_argument("--early-data", default=None,
                     help="curriculum: train on this data for the first --early-steps steps, then on --data")
     ap.add_argument("--early-steps", type=int, default=0)
+    ap.add_argument("--mix-data", default=None, help="also draw training clips from this dataset (small; every loader "
+                    "worker reads all of it)")
+    ap.add_argument("--mix-frac", type=float, default=0.0, help="share of clips drawn from --mix-data, per sample")
+    ap.add_argument("--init-ckpt", default=None,
+                    help="fine-tune: start enc/pred/tgt (and the mask head) from this full ckpt_*.pt, with a fresh "
+                         "optimizer and schedule from step 0 (ignored once the run has its own checkpoint)")
     ap.add_argument("--heldout", required=True, help="held-out triples at --res (jepatrain.data.build_heldout)")
     ap.add_argument("--res", type=int, required=True, help="input px; v2 is rendered at 256")
     ap.add_argument("--patch", type=int, default=8)
@@ -255,6 +261,10 @@ def main():
         raise SystemExit("--label-flip/--label-merge corrupt the object labels: they need --mask-weight > 0")
     if bool(a.early_data) != bool(a.early_steps) or not 0 <= a.early_steps < a.steps:
         raise SystemExit("--early-data and --early-steps go together, with 0 < --early-steps < --steps")
+    if bool(a.mix_data) != (a.mix_frac > 0) or not 0 <= a.mix_frac < 1:
+        raise SystemExit("--mix-data and 0 < --mix-frac < 1 go together")
+    if a.mix_data and a.early_data:
+        raise SystemExit("--mix-data with a curriculum is not supported")
 
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(a.seed)
@@ -282,6 +292,14 @@ def main():
         if a.mask_weight:
             head.load_state_dict(ck["head"])
         print(f"[train] resumed from {ck_path} at step {step}", flush=True)
+    elif a.init_ckpt:
+        ck = torch.load(a.init_ckpt, map_location=dev, weights_only=False)
+        enc.load_state_dict(ck["enc"]); pred.load_state_dict(ck["pred"]); tgt.load_state_dict(ck["tgt"])
+        if a.mask_weight:
+            if "head" not in ck:
+                raise KeyError(f"{a.init_ckpt} has no mask head but --mask-weight > 0")
+            head.load_state_dict(ck["head"])
+        print(f"[train] initialised from {a.init_ckpt} (its step {ck['step']}); fresh optimizer, step 0", flush=True)
     with open(os.path.join(a.out, "args.json"), "w") as f:
         json.dump(vars(a), f, indent=1)
     n_params = sum(p.numel() for p in params)
@@ -292,7 +310,8 @@ def main():
         exclude = set(json.load(f))
     def make_loader(data, ctx=None):
         return torch.utils.data.DataLoader(PossibleClips(data, exclude, a.res, seed=a.seed + step,
-                                                         tokseg=bool(a.mask_weight)), batch_size=a.batch,
+                                                         tokseg=bool(a.mask_weight), mix_data=a.mix_data,
+                                                         mix_frac=a.mix_frac), batch_size=a.batch,
                                            num_workers=a.workers, pin_memory=True, persistent_workers=True,
                                            prefetch_factor=4, multiprocessing_context=ctx)
     early = a.early_data is not None and step < a.early_steps

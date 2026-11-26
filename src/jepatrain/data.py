@@ -265,27 +265,29 @@ class PossibleClips(torch.utils.data.IterableDataset):
     Shards are split across workers and reshuffled every pass; a buffer shuffles clips within a worker."""
 
     def __init__(self, data: str, exclude_ids: set[str], res: int, split: str = "train", buffer: int = 256,
-                 seed: int = 0, tokseg: bool = False):
+                 seed: int = 0, tokseg: bool = False, mix_data: str | None = None, mix_frac: float = 0.0):
         self.shards = sorted(glob.glob(os.path.join(data, split, "possible", "*.tar")))
         if not self.shards:
             raise FileNotFoundError(f"no possible shards under {data}/{split}")
         self.exclude, self.buffer, self.seed, self.res = exclude_ids, buffer, seed, res
         self.tokseg = tokseg  # also yield per-token object labels (shards from prep_cloud --tokseg)
+        # mixing: each sample comes from mix_data with probability mix_frac. Every worker reads ALL mix shards (the
+        # mix set is small), so batches mix at the sample level rather than shard by shard.
+        if bool(mix_data) != (mix_frac > 0) or not 0 <= mix_frac < 1:
+            raise ValueError("mix_data and 0 < mix_frac < 1 go together")
+        self.mix_shards = sorted(glob.glob(os.path.join(mix_data, split, "possible", "*.tar"))) if mix_data else []
+        if mix_data and not self.mix_shards:
+            raise FileNotFoundError(f"no possible shards under {mix_data}/{split}")
+        self.mix_frac = mix_frac
 
-    def __iter__(self):
-        torch.set_num_threads(1)
-        wi = torch.utils.data.get_worker_info()
-        wid, nw = (wi.id, wi.num_workers) if wi else (0, 1)
-        rng = random.Random(self.seed * 1000 + wid)
-        mine = self.shards[wid::nw]
-        if not mine:
-            raise RuntimeError(f"worker {wid} has no shards ({len(self.shards)} shards, {nw} workers)")
-        buf = []
+    def _stream(self, shards: list[str], rng: random.Random, wid: int):
+        """Endless decoded clips from `shards`, reshuffled each pass, held-out ids skipped."""
+        shards = list(shards)
         while True:
-            rng.shuffle(mine)
+            rng.shuffle(shards)
             seen = 0
             # this class already splits shards across workers; WebDataset's own worker split would split again
-            for s in wds.WebDataset(mine, shardshuffle=False, empty_check=False, workersplitter=lambda src: src):
+            for s in wds.WebDataset(shards, shardshuffle=False, empty_check=False, workersplitter=lambda src: src):
                 seen += 1
                 if s["__key__"] in self.exclude:
                     continue
@@ -295,11 +297,26 @@ class PossibleClips(torch.utils.data.IterableDataset):
                     if "tokseg.npy" not in s:
                         raise KeyError(f"{s['__key__']}: no tokseg.npy (prepare shards with prep_cloud --tokseg)")
                     clip = (clip, torch.from_numpy(np.load(io.BytesIO(s["tokseg.npy"]))))
-                buf.append(clip)
-                if len(buf) >= self.buffer:
-                    yield buf.pop(rng.randrange(len(buf)))
+                yield clip
             if seen == 0:
-                raise RuntimeError(f"worker {wid}: a full pass over {mine} yielded no samples")
+                raise RuntimeError(f"worker {wid}: a full pass over {shards} yielded no samples")
+
+    def __iter__(self):
+        torch.set_num_threads(1)
+        wi = torch.utils.data.get_worker_info()
+        wid, nw = (wi.id, wi.num_workers) if wi else (0, 1)
+        rng = random.Random(self.seed * 1000 + wid)
+        mine = self.shards[wid::nw]
+        if not mine:
+            raise RuntimeError(f"worker {wid} has no shards ({len(self.shards)} shards, {nw} workers)")
+        main = self._stream(mine, rng, wid)
+        mix = self._stream(self.mix_shards, random.Random(self.seed * 1000 + wid + 500), wid) if self.mix_shards else None
+        buf = []
+        while True:
+            src = mix if (mix is not None and rng.random() < self.mix_frac) else main
+            buf.append(next(src))
+            if len(buf) >= self.buffer:
+                yield buf.pop(rng.randrange(len(buf)))
 
 
 def main():

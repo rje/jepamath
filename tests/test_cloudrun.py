@@ -481,3 +481,76 @@ def test_vast_network_error_is_vast_error(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", boom)
     with pytest.raises(VastError, match="network error"):
         Vast("k").instances()
+
+
+# ---------- 26 Nov perf review: stale heartbeat, failed-host avoidance, destroy retries ----------
+
+def test_a_stale_heartbeat_is_a_wedged_box():
+    j = job(watch=Watch(hb_stale_min=12, setup_grace_min=40))
+    hb = {"phase": "data", "step": 0, "exit_rc": None}
+    assert sup.decide(obs(hb=hb, t_hb=10_000.0 - 11 * 60), j)[0] == "continue"
+    a, r = sup.decide(obs(hb=hb, t_hb=10_000.0 - 13 * 60), j)
+    assert a == "replace_failure" and "wedged" in r
+    done = {"phase": "done", "step": 600, "exit_rc": 0}
+    assert sup.decide(obs(hb=done, t_hb=10_000.0 - 60 * 60), j)[0] == "done"   # exit status wins
+
+
+def _state(tmp_path, name, episodes):
+    (tmp_path / f"{name}.json").write_text(json.dumps({"job": name, "spent": 0, "failures": 0, "outcome": None,
+                                                       "episodes": episodes}))
+
+
+def test_failed_hosts_are_avoided_for_a_day(tmp_path):
+    now = 1_000_000.0
+    ep = lambda offer, reason, age_h, step=0, machine=None: {"offer": offer, "machine": machine, "end": now - age_h * 3600,
+                                                          "end_reason": reason, "max_step": step}
+    _state(tmp_path, "a", [ep(1, "no heartbeat 12 min after renting (status loading): boot hung", 1, machine=9),
+                           ep(2, "instance exited (preempted?)", 1),                    # market, not the host
+                           ep(3, "no heartbeat 12 min after renting: boot hung", 30),  # too old
+                           ep(4, "heartbeat unchanged for 12 min (phase data, step 0): box wedged", 2)])
+    _state(tmp_path, "b", [ep(5, "no progress 40 min into the episode (phase data)", 3)])
+    bad = sup.failed_hosts(tmp_path, now=now)
+    assert bad == {("offer", 1), ("machine", 9), ("offer", 4), ("offer", 5)}
+
+
+def test_provision_skips_failed_hosts(tmp_path):
+    class V(FakeVast):
+        def search_all(self, m):
+            return [offer(id=7, machine_id=70), offer(id=8, machine_id=80, min_bid=0.3)]
+    v = V([["running"]])
+    j = job()
+    p = Project(bucket="b", b2_env="", vast_env="", repo="o/r", state_dir=str(tmp_path))
+    inst, rate, od, o = sup.provision(j, p, v, B2Creds("k", "s", "e"), "c", 0, lambda m: None,
+                                      avoid={("machine", 70)})
+    assert o["id"] == 8
+    with pytest.raises(RuntimeError, match="failed in the last"):
+        sup.provision(j, p, v, B2Creds("k", "s", "e"), "c", 0, lambda m: None, avoid={("offer", 7), ("offer", 8)})
+
+
+def test_a_failed_destroy_is_retried_then_stops_and_is_retried_at_restart(tmp_path, monkeypatch):
+    from cloudrun.vast import VastError
+    monkeypatch.setattr(sup, "DESTROY_WAIT_S", 0)
+    s3 = FakeS3()
+
+    class V(FakeVast):
+        fail = True
+
+        def destroy(self, inst):
+            if self.fail:
+                raise VastError("DNS down")
+            super().destroy(inst)
+    v = V([["running"]])
+    j = job(watch=Watch(poll_s=0))
+    p = Project(bucket="b", b2_env="", vast_env="", repo="o/r", state_dir=str(tmp_path))
+
+    def hb(*_a, **_k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(sup, "heartbeat", hb)
+    out = sup.run(j, p, v, s3, B2Creds("k", "s", "e"), "c", out=lambda m: None)
+    st = json.loads((tmp_path / "t.json").read_text())
+    assert out.startswith("stopped") and "could not be destroyed" in out and st["episodes"][0]["destroy_pending"]
+    v.fail = False
+    j2 = job(budget=Budget(max_spend=1e-12, max_hours=1), watch=Watch(poll_s=0))   # stop before renting
+    sup.run(j2, p, v, s3, B2Creds("k", "s", "e"), "c", out=lambda m: None)
+    st = json.loads((tmp_path / "t.json").read_text())
+    assert 101 in v.destroyed and not st["episodes"][0]["destroy_pending"]

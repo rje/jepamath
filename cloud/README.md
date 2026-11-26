@@ -55,3 +55,21 @@ versions). A dedicated bucket needs a key that can create buckets: make one in t
   restarted (it destroys orphaned episodes on start) or it is destroyed by hand. Run it under `nohup`
   and check `python -m cloudrun instances` after any local crash.
 - The instance holds the B2 key in its environment; the host operator can read it.
+
+## Cost rules (26 Nov perf review)
+
+Of the $112.59 spent over 215 episodes, $14.84 went to boxes that never trained. Of that, 43 were boot hangs
+($9.02), and 11 of those came straight after a hang on the same offer. Rules since then:
+
+- **Failed hosts are skipped for 24 h.** The supervisor reads every job's state and does not rent an offer or
+  machine that hung at boot, made no progress within the setup grace, or wedged
+  (`supervisor.failed_hosts`). Preemptions don't count, since they are the market rather than the host.
+- **Early heartbeat and stale-heartbeat rule.** onstart publishes a `booted` heartbeat right after the code
+  fetch. After that, a heartbeat whose content is unchanged for `watch.hb_stale_min` (default 12) means a wedged
+  box in any phase (restore, setup, data, run). The syncer rewrites the heartbeat every minute.
+- **Destroy is retried.** It gets 6 tries, 30 s apart. If all fail, the episode is marked `destroy_pending`, the
+  supervisor stops renting, and the next supervisor start retries the destroy.
+- **Inline evals.** Endpoint-focused 30k jobs pass `--eval-every 15000`, which evaluates at 0, 15k and 30k and
+  saves weights there. That saves 8–11 min per run. The 500-step recovery checkpoints are unchanged. The evals
+  use no RNG, so this does not change the training trajectory. Keep 2500 only where the eval curve is the
+  measurement.

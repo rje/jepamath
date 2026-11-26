@@ -75,6 +75,7 @@ class Watch:
     boot_min: float = 12            # no heartbeat at all (image pull / boot hung) for this long -> replace
     setup_grace_min: float = 45     # no step yet this episode for this long -> replace
     stall_min: float = 20           # step stopped advancing for this long -> replace
+    hb_stale_min: float = 12        # heartbeat content unchanged this long (syncer writes every minute) -> replace
     poll_s: float = 60
     max_failures: int = 2           # crashes/stalls after progress before giving up
 

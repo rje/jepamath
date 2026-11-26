@@ -5,8 +5,8 @@ with the final count on some within-scene pairs.
   net 0 : BB-BB, HB-BH, BH-HB   x n0 in {1, 2, 3}
   net +1: BB-HB, HB-BB          x n0 in {1, 2}
   net -1: BH-BB, BB-BH          x n0 in {2, 3}
-Objects: id0-2 box pool at fixed slots (n0 uses the first n0, the rest in reserve), id3 hopper, id4 reserve. Sizes per
-object: small U(.033, .040) or big U(.056, .062), p = 1/2. One shape per scene (seed mod 3). The claw takes the
+Objects: id0-2 box pool at fixed slots (n0 uses the first n0, the rest in reserve), id3 hopper, id4 reserve. Sizes per object AND per
+history (amendment 1): ONE class per history, small U(.033, .038) or big U(.058, .062), p = 1/2. One shape per scene (seed mod 3). The claw takes the
 tallest object, so final box contents come from the simulation (c9_score.final_objects), not the schedule.
 Checks as C9 sources (validate_clip, item_checks, transfer_records), one ctx / first post slot per scene.
 
@@ -33,7 +33,7 @@ from jepagen.validate import validate_clip  # noqa: E402
 from jepatrain.data import downsample  # noqa: E402
 from reversal_items import _drop, box_tokens  # noqa: E402
 
-SMALL, BIG = (0.033, 0.040), (0.056, 0.062)
+SMALL, BIG = (0.033, 0.038), (0.058, 0.062)   # 3 small < 2 big in radius sum, area and volume
 R = {"BB": BB, "HB": HB, "BH": BH}
 ROUTES = {"BB-BB": 0, "HB-BH": 0, "BH-HB": 0, "BB-HB": 1, "HB-BB": 1, "BH-BB": -1, "BB-BH": -1}
 N0 = {0: (1, 2, 3), 1: (1, 2), -1: (2, 3)}
@@ -52,7 +52,6 @@ def make_sources(base, seed: int) -> dict:
     slots = [_floor(bx, bx.center[0] - 0.07, bx.center[1] - 0.045), _floor(bx, bx.center[0] + 0.07, bx.center[1] - 0.045),
              _floor(bx, bx.center[0], bx.center[1] + 0.065)]
     hop = _floor(hp, hp.center[0], hp.center[1])
-    radii = [float(rng.uniform(*(BIG if rng.uniform() < 0.5 else SMALL))) for _ in range(4)]
     hints = [{"box": _drop(rng, bx), "hopper": _drop(rng, hp)} for _ in range(2)]
     o = sorted(base.objects, key=lambda x: x.id)
     if len(o) < 4:
@@ -60,6 +59,11 @@ def make_sources(base, seed: int) -> dict:
     protos = [o[i % len(o)].model_copy(update={"id": i}) for i in range(5)]
     out = {}
     for n0, r in HISTORIES:
+        # sizes drawn per HISTORY (amendment 1): with one shared pool, 3- and 2-object endings always overlap and a
+        # size-opposed pair (E4) cannot occur
+        # one size class per history (as v4b: one base radius per clip), independent of n0 and route
+        band = BIG if rng.uniform() < 0.5 else SMALL
+        radii = [float(rng.uniform(*band)) for _ in range(4)]
         routes = tuple(R[x] for x in r.split("-"))
         objs = [_obj(protos[i], shape, radii[i], "box" if i < n0 else "reserve", slots[i] if i < n0 else None)
                 for i in range(3)]

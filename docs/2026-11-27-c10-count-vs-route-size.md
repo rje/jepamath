@@ -22,7 +22,7 @@ One base scene uses the C6/C9 machinery: occluded, two transfers, retimed so bot
 
 **Objects.** There are three box objects (n0 uses the first n0, the rest go to reserve) at fixed slots, one hopper object, and one reserve. One shape per scene (seed mod 3), with 80 scenes per shape and 240 in all.
 
-**Sizes.** Each object independently gets small U(0.033, 0.040) or big U(0.056, 0.062), each with probability 1/2. So summed radius, area and volume often disagree with the count. The claw takes the tallest object, so the box contents are read from the simulation (`final_objects`), not from the schedule.
+**Sizes (amendment 1).** One size class per history, small U(0.033, 0.038) or big U(0.058, 0.062), each with probability 1/2, independent of n0 and route (one shared pool made E4 impossible). So summed radius, area and volume often disagree with the count. The claw takes the tallest object, so the box contents are read from the simulation (`final_objects`), not from the schedule.
 
 **Checks.** As C9 sources: validate_clip; simulator transfer records (actual src/dst, release inside the context, carried object visible outside the hopper mask, src/dst cues); one ctx and first post slot per scene.
 

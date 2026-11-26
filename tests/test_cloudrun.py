@@ -713,7 +713,7 @@ def test_b2_read_errors_skip_the_poll_then_a_long_outage_stops(tmp_path, monkeyp
     monkeypatch.setattr(sup.time, "time", fake_time)
     out = sup.run(job(budget=Budget(max_spend=50, max_hours=10), watch=Watch(poll_s=0)), _p(tmp_path), v, FakeS3(),
                   B2Creds("k", "s", "e"), "c", out=lambda m: None)
-    assert out.startswith("stop") and "B2 unreadable" in out and calls["n"] > 5 and v.destroyed == [101]
+    assert out.startswith("stop") and "B2 heartbeat unreadable" in out and calls["n"] > 5 and v.destroyed == [101]
 
 
 def test_an_ambiguous_rent_failure_never_rents_a_second_box(tmp_path, monkeypatch):
@@ -769,3 +769,117 @@ def test_a_peer_state_of_the_wrong_shape_is_skipped(tmp_path):
     (tmp_path / "a.json").write_text("[]")
     with pytest.raises(ValueError):
         sup.failed_hosts(tmp_path, "a", out=lambda m: None)
+
+
+# ---------- 26 Nov, Astra's third validation of d5a5f8e ----------
+
+def test_a_pulse_outage_never_hides_a_readable_exit(tmp_path, monkeypatch):
+    from botocore.exceptions import EndpointConnectionError
+    s3 = FakeS3()
+    s3.put_object("b", "runs/t/heartbeat/ep000.json", json.dumps({"episode": 0, "step": 600, "exit_rc": 0, "phase": "done", "time": 1}))
+
+    def pl(*_a, **_k):
+        raise EndpointConnectionError(endpoint_url="https://b2")
+    monkeypatch.setattr(sup, "pulse", pl)
+    out = sup.run(job(watch=Watch(poll_s=0)), _p(tmp_path), FakeVast([["running"]]), s3, B2Creds("k", "s", "e"), "c",
+                  out=lambda m: None)
+    assert out == "done"
+
+
+def test_charges_seen_in_the_same_poll_beat_a_done(tmp_path):
+    s3 = FakeS3()
+    s3.put_object("b", "runs/t/heartbeat/ep000.json", json.dumps({"episode": 0, "step": 600, "exit_rc": 0, "phase": "done", "time": 1}))
+    v = FakeVast([["running"]])
+    v.bw = 6.0                                   # $6 of bandwidth reported by this poll, cap $5
+    out = sup.run(job(watch=Watch(poll_s=0)), _p(tmp_path), v, s3, B2Creds("k", "s", "e"), "c", out=lambda m: None)
+    assert out.startswith("stop: spend cap")
+
+
+def test_a_legacy_record_whose_box_is_already_gone_adds_no_spend(tmp_path):
+    v = FakeVast([])
+    now = time.time()
+    (tmp_path / "t.json").write_text(json.dumps({"job": "t", "spent": 1.0, "failures": 0, "outcome": None,
+        "episodes": [{"n": 0, "instance": 55, "rate": 1.0, "start": now - 90000, "end": now - 86400,
+                      "end_reason": "job exited 0", "max_step": 5, "destroy_pending": True}]}))
+    st = sup.State(tmp_path / "t.json", "t")
+    assert sup.recover(st, v, lambda m: None).startswith("done")       # the legacy decision is applied
+    assert st.d["spent"] == 1.0 and st.d["outcome"] == "done"
+
+
+def test_a_destroy_that_succeeds_on_the_second_round_lets_the_replacement_run(tmp_path, monkeypatch):
+    from cloudrun.vast import VastError
+    monkeypatch.setattr(sup, "DESTROY_WAIT_S", 0)
+    s3 = FakeS3()
+
+    class V(FakeVast):
+        fails = sup.DESTROY_TRIES          # the whole first round fails, the second succeeds
+
+        def destroy(self, inst):
+            if self.fails:
+                self.fails -= 1
+                raise VastError("DNS down")
+            super().destroy(inst)
+    v = V([["running", "exited"], ["running"]])
+    real_hb = sup.heartbeat
+
+    def hb(s3_, project, name, ep):
+        if ep == 1:
+            s3.put_object("b", f"runs/{name}/heartbeat/ep001.json",
+                          json.dumps({"episode": 1, "step": 600, "exit_rc": 0, "phase": "done", "time": 1}))
+        return real_hb(s3_, project, name, ep)
+    monkeypatch.setattr(sup, "heartbeat", hb)
+    out = sup.run(job(watch=Watch(poll_s=0)), _p(tmp_path), v, s3, B2Creds("k", "s", "e"), "c", out=lambda m: None)
+    assert out == "done" and len(v.rented) == 2
+
+
+def test_an_explicit_refusal_in_a_2xx_reply_is_definite():
+    from cloudrun.vast import Vast, VastError
+
+    class V(Vast):
+        def call(self, *a, **k):
+            return {"success": False, "error": "no_such_ask", "msg": "gone"}
+    with pytest.raises(VastError) as ei:
+        V("k").rent(7, {})
+    assert ei.value.definite
+
+    class W(Vast):
+        def call(self, *a, **k):
+            return {"weird": True}
+    with pytest.raises(VastError) as ei:
+        W("k").rent(7, {})
+    assert not ei.value.definite
+
+
+def test_a_late_listed_rent_is_destroyed_before_the_next_rent(tmp_path):
+    v = FakeVast([["running"]])
+    v.live[77] = ["running"]
+
+    class V(FakeVast):
+        pass
+    now = time.time()
+    st = sup.State(tmp_path / "t.json", "t")
+    st.d["late_labels"] = [{"label": "cloudrun:t:ep0:x", "offer": 7, "rate": 0.3, "od": False, "time": now - 3600}]
+    v.instances = lambda: [{"id": i, "actual_status": "running", "label": "cloudrun:t:ep0:x" if i == 77 else None}
+                           for i in v.live]
+    inst, e = sup.provision(job(), _p(tmp_path), v, B2Creds("k", "s", "e"), "c", 0, lambda m: None, st=st)
+    assert 77 in v.destroyed and e["n"] == 1 and st.d["late_labels"] == [] and st.d["episodes"][0]["end"]
+
+
+def test_the_summary_reports_the_persisted_outcome(tmp_path, monkeypatch):
+    s3 = FakeS3()
+    s3.put_object("b", "runs/t/heartbeat/ep000.json", json.dumps({"episode": 0, "step": 600, "exit_rc": 0, "phase": "done", "time": 1}))
+    real = sup._end_episode
+    msgs = []
+
+    def end(*a, **k):
+        real(*a, **k)
+        raise sup._Terminate("signal 15")
+    monkeypatch.setattr(sup, "_end_episode", end)
+    sup.run(job(watch=Watch(poll_s=0)), _p(tmp_path), FakeVast([["running"]]), s3, B2Creds("k", "s", "e"), "c", out=msgs.append)
+    assert any(m.startswith("t: done;") for m in msgs)
+
+
+def test_a_peer_episode_with_a_bad_end_is_skipped(tmp_path):
+    _state(tmp_path, "peer", [{"n": 0, "end": "yesterday", "end_reason": "boot hung"}])
+    _state(tmp_path, "a", [])
+    assert sup.failed_hosts(tmp_path, "a", out=lambda m: None) == set()

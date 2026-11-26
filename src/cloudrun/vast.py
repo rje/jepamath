@@ -29,9 +29,14 @@ class VastError(RuntimeError):
     """`code` is the HTTP status when Vast answered (a 4xx is a definite refusal), None for a network failure
     or an unexpected reply, where the request may or may not have taken effect."""
 
-    def __init__(self, msg: str, code: int | None = None):
+    def __init__(self, msg: str, code: int | None = None, refused: bool = False):
         super().__init__(msg)
-        self.code = code
+        self.code, self.refused = code, refused
+
+    @property
+    def definite(self) -> bool:
+        """Vast clearly did not do it: a 4xx, or a reply that says so (success false with an error)."""
+        return self.refused or (self.code is not None and 400 <= self.code < 500)
 
 
 class Vast:
@@ -72,7 +77,9 @@ class Vast:
         r = self.call("PUT", f"/asks/{offer_id}/", body)
         inst = r.get("new_contract")
         if not inst:
-            raise VastError(f"create failed: {r}")
+            # {"success": false, "error": "no_such_ask", ...} is an explicit refusal; any other reply without a
+            # contract is ambiguous and the supervisor reconciles it by label
+            raise VastError(f"create failed: {r}", refused=r.get("success") is False and bool(r.get("error")))
         return int(inst)
 
     def instances(self) -> list[dict]:

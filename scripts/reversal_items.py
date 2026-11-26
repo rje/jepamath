@@ -165,6 +165,8 @@ def main():
     ap.add_argument("--max-render-fps", type=float, default=60.0)
     ap.add_argument("--batch", type=int, default=16, help="scenes per GPU submission (4 clips each)")
     a = ap.parse_args()
+    if os.path.exists(a.out) and os.listdir(a.out):
+        raise SystemExit(f"{a.out} is not empty: refusing to append (duplicate scenes would narrow the bootstrap)")
     os.makedirs(a.out, exist_ok=True)
     t, man = load_yaml(a.template, Template), Manifest()
     lim = RenderLimiter(os.path.join(a.out, ".limiter"), a.max_render_fps)

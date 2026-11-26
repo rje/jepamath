@@ -132,14 +132,32 @@ breaks ties uniformly.
 **Item set.** Seeds 905000 and up (disjoint from the pilot), 200 accepted scenes per n0. The size is fixed, and no
 scenes are added after scoring. Scene-cluster bootstrap stratified by n0, equal n0 weights, 95% CIs.
 
+**Amendment (26 Nov, after Astra's code review; before any trained model was scored).** The hopper is visible in
+the context, so box = scene total − hopper is readable from the last context frame without seeing any transfer.
+A state oracle using that rule scores 99% identification on the fixed set. So:
+
+- **Unmasked context (registered primary score):** supports only a *history-specific prediction* claim, whether
+  from the transfers or from their visible consequence in the hopper.
+- **Hopper-masked context (new arm, the action-use test):** the projected hopper volume, dilated one patch, is
+  painted out in every context frame. The target is unchanged.
+
+Code fixes in the same review:
+- the predictor is queried with every future token, as in prefix training, before the box tokens are selected;
+- model ties count as wrong;
+- seeds must be unique, with exactly 200 per n0, and the builder refuses to append;
+- last-visible-count is |final_e − n0|;
+- pixel L1 is computed per frame;
+- magnitude and identification are given as a paired difference against the last-transfer oracle.
+
 **Primary model:** object-label mask05-100k. Every other model is exploratory.
 
 - **H-C1 (history used):** identification lower bound > 0.30 and reversal lower bound > 0.05. History-blind
   scorers get 0.25 and 0.
 - **H-C1′ (not used):** identification upper bound < 0.30. This rules out an effect of that size on this readout
   only.
-- **H-C2 (more than one transfer's worth):** identification lower bound > 0.75, which beats every partial-history
-  oracle.
+- **H-C2 (action route used), hopper-masked arm:** identification lower bound > 0.30 and reversal lower bound
+  > 0.05.
+- **H-C2+ (more than one transfer's worth), hopper-masked arm:** identification lower bound > 0.75.
 - **Inconclusive:** neither H-C1 nor H-C1′ holds.
 - **Magnitude** is reported against both 0.50 and the last-transfer oracle's 0.83. Only > 0.83 rules out a
   last-transfer reader.

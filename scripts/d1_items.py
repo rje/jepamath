@@ -177,12 +177,26 @@ def main():
 
     def flush():
         nonlocal kept
-        res = run_episodes_batched([e for _, h in pending for e in h.values()], lim)
-        j = 0
+        # one simulator error (e.g. "claw: no object in region hopper to pick") aborts a whole batch: re-run that
+        # batch scene by scene and reject the scenes that raise, with the error as the logged reason
+        try:
+            res = run_episodes_batched([e for _, h in pending for e in h.values()], lim)
+            per_scene = {}
+            j = 0
+            for seed, h in pending:
+                per_scene[seed] = res[j:j + len(h)]; j += len(h)
+        except RuntimeError:
+            per_scene = {}
+            for seed, h in pending:
+                try:
+                    per_scene[seed] = run_episodes_batched(list(h.values()), lim)
+                except RuntimeError as ex:
+                    rej.write(json.dumps({"seed": seed, "reasons": [f"simulator: {ex}"]}) + "\n"); rej.flush()
         for seed, h in pending:
+            if seed not in per_scene:
+                continue
             reasons, clips = [], {}
-            for k, ep in h.items():
-                clip, diag = res[j]; j += 1
+            for (k, ep), (clip, diag) in zip(h.items(), per_scene[seed]):
                 clips[k] = (clip, diag)
                 v = validate_clip(clip, diag)
                 reasons += [f"{k}: {r}" for r in v.reasons]

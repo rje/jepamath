@@ -77,3 +77,17 @@ The model's predicted hidden ending is ordered by a quantity that integrates the
 4. **Bootstrap strata.** Strata are slot order × metadata-area sign × pixel-area sign, the cells the design fixes. An exactly balanced reader is therefore not failed by resampling noise: with order-only strata, the 97.5th percentile for an exactly balanced reader is about 0.550, which fails a strict < 0.55 gate.
 5. **Weakest input.** The gate's "weakest input" is `min_3_of_means`: the minimum over N, add and remove of the means within each bootstrap draw, not the mean of per-block minima.
 6. **Reported per cell.** Results are also reported per design cell, including the cell where both area signs favour the 1-object ending.
+
+## Amendment 2 (27 Nov, before the manifest freeze and before any checkpoint inference)
+
+**Problem.** The registered selector balanced only the pairs that a pure max-IoU assignment produced. For slot order "False" it could not fill the cells: the cell where both areas favour the 1-object ending had 81 pairs, and 84 were needed. Astra's review predicted this. The registered top-up, more donors, would not fix it, because the bottleneck is the assignment.
+
+**Change.** Cell quotas are now built into the assignment (`--balance-area`, rewritten):
+
+- Each slot order is filled cell by cell, scarcest first: (meta−, pix+), (meta+, pix−), (−, −), (+, +).
+- Each cell uses a max-IoU assignment over the still-unused sources and donors whose pair falls in that cell.
+- The discordant quota b is the largest feasible value up to per_order/4. Donors are used once across both orders.
+
+**Result.** b = 50 in both orders, so all four cells hold exactly 50 blocks per order. That is 400 blocks with unique donors, and mean IoU is 0.959.
+
+Nothing else changes.

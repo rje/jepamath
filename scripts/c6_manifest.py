@@ -100,21 +100,50 @@ def main():
             return None             # an exact tie belongs to neither sign: such pairs are excluded from balancing
         return (bool(D[j]["meta31"] > 0), bool(pix[2] > pix[0]))
     if a.balance_area:
+        # Amendment 2 (27 Nov, before freeze): cell quotas are built INTO the assignment. For each slot order and a
+        # discordant quota b (largest feasible, at most per_order/4), the cells are filled scarcest-first, each by a
+        # max-IoU assignment over the still-unused sources and donors whose pair falls in that cell; the two
+        # concordant cells get per_order/2 - b each. Donors are used once across both orders.
         if not a.per_order or a.per_order % 2:
             raise SystemExit("--balance-area needs an even --per-order")
-        kept = []
+        used_d, kept = set(), []
+        order_cells = [(False, True), (True, False), (False, False), (True, True)]
         for o in (True, False):
-            po = sorted([(i, j) for i, j in pairs if S[i]["add_first"] == o], key=lambda t: S[t[0]]["seed"])
-            cells = {k: [t for t in po if signs(*t) == k] for k in [(True, True), (False, False), (True, False), (False, True)]}
-            half = a.per_order // 2
-            b = min(len(cells[(True, False)]), len(cells[(False, True)]), half)
-            c = half - b
-            if len(cells[(True, True)]) < c or len(cells[(False, False)]) < c:
-                raise SystemExit(f"slot order {o}: cells {[len(v) for v in cells.values()]} (++, --, +-, -+) cannot balance "
-                                 f"{a.per_order}: render the registered top-up")
-            kept += cells[(True, True)][:c] + cells[(False, False)][:c] + cells[(True, False)][:b] + cells[(False, True)][:b]
-            print(f"slot order {o}: concordant {c}+{c}, discordant {b}+{b} (available "
-                  f"{[len(v) for v in cells.values()]})")
+            src_o = [i for i in range(len(S)) if S[i]["add_first"] == o]
+            sign = {(i, j): signs(i, j) for i in src_o for j in range(len(D)) if W[i, j] >= 0}
+            done = None
+            for b in range(a.per_order // 4, -1, -1):
+                quota = {(False, True): b, (True, False): b, (False, False): a.per_order // 2 - b,
+                         (True, True): a.per_order // 2 - b}
+                us, ud, got = set(), set(used_d), []
+                ok = True
+                for cell in order_cells:
+                    rows = [i for i in src_o if i not in us]
+                    cols = [j for j in range(len(D)) if j not in ud]
+                    M = np.array([[W[i, j] if W[i, j] >= 0 and sign.get((i, j)) == cell else -1.0 for j in cols]
+                                  for i in rows]) if rows and cols else np.zeros((0, 0))
+                    if M.size == 0:
+                        ok = quota[cell] == 0
+                        if not ok:
+                            break
+                        continue
+                    rr, cc = linear_sum_assignment(np.where(M >= 0, M, -1e3), maximize=True)
+                    cand = sorted([(M[x, y], rows[x], cols[y]) for x, y in zip(rr, cc) if M[x, y] >= 0], reverse=True)
+                    if len(cand) < quota[cell]:
+                        ok = False
+                        break
+                    for _, i, j in cand[:quota[cell]]:
+                        us.add(i); ud.add(j); got.append((i, j))
+                if ok:
+                    done = (b, got, ud)
+                    break
+            if done is None:
+                raise SystemExit(f"slot order {o}: no balanced assignment of {a.per_order}: render the registered top-up")
+            b, got, ud = done
+            used_d = ud
+            kept += got
+            print(f"slot order {o}: balanced assignment with discordant {b}+{b}, concordant "
+                  f"{a.per_order // 2 - b}+{a.per_order // 2 - b}")
         pairs = kept
     elif a.per_order:
         kept = []

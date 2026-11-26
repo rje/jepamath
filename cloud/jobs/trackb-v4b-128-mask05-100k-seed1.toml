@@ -43,7 +43,7 @@ min_ram_gb = 48
 min_inet_down_mbps = 500
 
 [budget]
-max_spend = 7.0
+max_spend = 9.0   # 27 Nov: raised from 7 (two slow hosts + a preemption ate $2.9); still within the night's $30
 max_hours = 6
 
 [watch]

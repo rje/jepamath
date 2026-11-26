@@ -52,7 +52,7 @@ def edge_scores(p: np.ndarray) -> dict[str, float]:
         v = [0.5 if abs(p[IX[hi]] - p[IX[lo]]) <= TIE else float(p[IX[hi]] > p[IX[lo]]) for lo, hi in es]
         out[k] = float(np.mean(v))
     out["mean_3"] = (out["N"] + out["add"] + out["remove"]) / 3
-    out["min_3"] = min(out["N"], out["add"], out["remove"])
+    out["min_3"] = min(out["N"], out["add"], out["remove"])   # per block; the gate uses the bootstrap's min_3_of_means
     return out
 
 
@@ -83,6 +83,11 @@ def bootstrap(per: dict[str, list[dict]], strata: np.ndarray, n: int, pairs: lis
             draws[nm].append(A[idx].mean(0))
     out = {nm: {k: {"est": float(A[:, j].mean()), "ci": np.percentile(np.array(draws[nm])[:, j], [2.5, 97.5]).tolist()}
                 for j, k in enumerate(keys)} for nm, A in arr.items()}
+    # the weakest input, taken AFTER averaging within each draw (Astra review, 27 Nov): the registered gate quantity
+    j3 = [keys.index(k) for k in ("N", "add", "remove")]
+    for nm, A in arr.items():
+        m = np.array(draws[nm])[:, j3].min(1)
+        out[nm]["min_3_of_means"] = {"est": float(A[:, j3].mean(0).min()), "ci": np.percentile(m, [2.5, 97.5]).tolist()}
     out["paired"] = {}
     for a, b in pairs:
         D = np.array(draws[a]) - np.array(draws[b])
@@ -119,9 +124,18 @@ def main():
         if s["names"] != NAMES or [int(x) for x in d["names"]] != [1, 2, 3] or actual_finals(s).tolist() != FIN.tolist():
             raise SystemExit(f"block {p['source']}/{p['donor']}: order or simulated finals wrong")
         blocks.append((p, s, d, sp, dp))
-    strata = np.array([s["add_first"] for _, s, _, _, _ in blocks])
+    # bootstrap strata: slot order x (with --balance-area manifests) metadata-area sign x pixel-area sign, the cells the
+    # design fixes, so an exactly balanced reader is not failed by resampling noise
+    def area_signs(p, d):
+        if not man.get("balance_area"):
+            return ""
+        from c6_manifest import meta31
+        zd = np.load(os.path.join(p["donor_dir"], f"donor_{p['donor']:09d}.npz"))
+        cov = zd["coverage"].reshape(3, -1)[:, p["common"]].sum(1)
+        return f"m{int(meta31(d) > 0)}p{int(cov[2] > cov[0])}"
+    strata = np.array([f"{s['add_first']}{area_signs(p, d)}" for p, s, d, _, _ in blocks])
     res = {"manifest": a.manifest, "n_blocks": len(blocks),
-           "add_first": {str(k): int((strata == k).sum()) for k in (True, False)},
+           "strata": {str(k): int((strata == k).sum()) for k in np.unique(strata)},
            "symbolic_edge_ceilings": symbolic_edge_ceilings(), "models": {}}
     per = {"state_counter": [edge_scores(actual_finals(s).astype(float)) for _, s, _, _, _ in blocks]}
     readers = {f"{r}:{d_}": [] for r in ("meta_area", "meta_volume", "pixel_last_ctx", "pixel_first") for d_ in ("pos", "neg")}
@@ -159,8 +173,11 @@ def main():
         print(f"[{name}] " + "  ".join(f"{k} {np.mean([b[k] for b in per[name]]):.3f}" for k in per[name][0]), flush=True)
     pairs = [(m, r) for m in res["models"] for r in readers] + [(m1, m2) for m1 in res["models"] for m2 in res["models"] if m1 != m2]
     res["bootstrap"] = bootstrap(per, strata, a.boot, pairs)
-    res["by_order"] = {nm: {str(o): {k: float(np.mean([b[k] for b, st_ in zip(bl, strata) if st_ == o])) for k in bl[0]}
+    order = np.array([s["add_first"] for _, s, _, _, _ in blocks])
+    res["by_order"] = {nm: {str(o): {k: float(np.mean([b[k] for b, st_ in zip(bl, order) if st_ == o])) for k in bl[0]}
                             for o in (True, False)} for nm, bl in per.items()}
+    res["by_cell"] = {nm: {str(c): {k: float(np.mean([b[k] for b, st_ in zip(bl, strata) if st_ == c])) for k in bl[0]}
+                           for c in np.unique(strata)} for nm, bl in per.items()}
     for nm in per:
         if nm not in res["models"]:
             print(f"[reader] {nm:22s} " + "  ".join(f"{k} {res['bootstrap'][nm][k]['est']:.3f}" for k in ("N", "add", "remove", "conflict")), flush=True)

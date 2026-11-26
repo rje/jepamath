@@ -96,6 +96,8 @@ def main():
     def signs(i, j):
         common = S[i]["box"] & D[j]["box"]
         pix = D[j]["cov"][:, common].sum(1)
+        if abs(pix[2] - pix[0]) <= 1e-9 or abs(D[j]["meta31"]) <= 1e-12:
+            return None             # an exact tie belongs to neither sign: such pairs are excluded from balancing
         return (bool(D[j]["meta31"] > 0), bool(pix[2] > pix[0]))
     if a.balance_area:
         if not a.per_order or a.per_order % 2:
@@ -135,7 +137,7 @@ def main():
         return
     if len(pairs) < a.min_pairs:
         raise SystemExit(f"only {len(pairs)} pairs < {a.min_pairs}: render the registered donor top-up first")
-    man = {"sources_dir": a.sources, "donors_dirs": a.donors, "min_iou": a.min_iou,
+    man = {"sources_dir": a.sources, "donors_dirs": a.donors, "min_iou": a.min_iou, "balance_area": a.balance_area,
            "max_area_ratio": a.max_area_ratio, **summary,
            "items_sha256": {d: sha(os.path.join(d, "items.jsonl")) for d in [a.sources, *a.donors]},
            "sources_unmatched": [S[i]["seed"] for i in range(len(S)) if i not in used],

@@ -60,3 +60,20 @@ The model's predicted hidden ending is ordered by a quantity that integrates the
 |---|---|
 | H-C8 passes | Launch `trackb-v4b-128-mask05-100k-seed1` and `trackb-v4b-128-cw50-100k-seed1`, each capped at $7. They test replication across training seeds and the contribution of object labels. |
 | H-C8 fails, or the item set is invalid | Nothing launches. |
+
+## Amendment 1 (27 Nov, before the manifest freeze and before any checkpoint inference; after Astra's design review)
+
+1. **The claim is narrowed.**
+   - **Problem.** Inside a source scene, every object has about the same size, so carried *area* always moves in the same direction as count.
+   - **Consequence.** A source that tracks area, read out through a donor-side contrast that rises with count, passes every edge. Such contrasts include spatial spread (3 objects more spread in 91 of 96 pilot donors), summed radii and individual size. On the C7 blocks, carried-area × donor-spread scores 0.985 and carried-area × summed-radii scores 1.000. Balancing donor area cannot exclude source-side area.
+   - **H-C8 now claims only this:** the predicted ending's graded ordering responds to each of N, add and remove, beyond:
+     - single-cue readers;
+     - the untrained network;
+     - area-sign readers, under donor pixel-area and metadata-area sign balance.
+   - **Not claimed.** C8 does **not** claim the source quantity is number rather than area.
+   - **Next.** Separating number from area on the source side needs histories where count and carried area move in opposite directions, using heterogeneous object sizes. That is planned as C9.
+2. **H-C8c is reinterpreted.** The additive rule N + A − R also passes the conflict edge. A pass therefore only constrains how strongly the initial cue can dominate; it does not exclude additive cues.
+3. **Ties.** Pairs whose metadata or pixel 3-vs-1 area is exactly tied are excluded from balanced selection.
+4. **Bootstrap strata.** Strata are slot order × metadata-area sign × pixel-area sign, the cells the design fixes. An exactly balanced reader is therefore not failed by resampling noise: with order-only strata, the 97.5th percentile for an exactly balanced reader is about 0.550, which fails a strict < 0.55 gate.
+5. **Weakest input.** The gate's "weakest input" is `min_3_of_means`: the minimum over N, add and remove of the means within each bootstrap draw, not the mean of per-block minima.
+6. **Reported per cell.** Results are also reported per design cell, including the cell where both area signs favour the 1-object ending.

@@ -100,7 +100,7 @@ def main():
     for k, key in ORACLES.items():
         res["baselines"][k] = summarize(endpoints([oracle_cross(items[i], items[j], key) for i, j, _ in pairs], As,
                                                   ties="uniform"))
-        print(f"[baseline] {k:20s} ident {res['baselines'][k]['ident']['est']:.3f}", flush=True)
+        print(f"[baseline] {k:20s} ident {res['baselines'][k]['ident']['est']:.3f} ident_pos {res['baselines'][k]['ident_pos']['est']:.3f}", flush=True)
     from jepatrain.reeval import load_run
     torch.set_num_threads(16)
     for run, w, name in zip(a.run, a.weights, a.name):
@@ -110,7 +110,9 @@ def main():
         r = summarize(endpoints(mats, As))
         r["run"], r["weights"], r["step"] = run, w, step
         res["models"][name] = r
-        print(f"[{name}] ident {r['ident']['est']:.3f} {r['ident']['ci']}  reversal {r['reversal']['est']:.3f} "
+        np.savez_compressed(os.path.splitext(a.out)[0] + f"_{name}_mats.npz", mats=np.stack(mats),
+                            src=np.array([items[i]["seed"] for i, _, _ in pairs]), donor=np.array([items[j]["seed"] for _, j, _ in pairs]))
+        print(f"[{name}] ident_pos {r['ident_pos']['est']:.3f} {r['ident_pos']['ci']}  ident {r['ident']['est']:.3f} {r['ident']['ci']}  reversal {r['reversal']['est']:.3f} "
               f"{r['reversal']['ci']}  margins {r['margin_by_delta']}", flush=True)
     json.dump(res, open(a.out, "w"), indent=1)
 

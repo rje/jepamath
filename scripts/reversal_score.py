@@ -97,6 +97,20 @@ def ident(S: np.ndarray, ties: str = "wrong") -> float:
     return float(np.mean(out))
 
 
+def ident_pos(S: np.ndarray, fin: np.ndarray, ties: str = "wrong") -> float:
+    """3-way identification on histories and endings with final count >= 1 (C5): an empty-vs-non-empty reader
+    gets chance (1/3) here."""
+    idx = np.flatnonzero(fin >= 1)
+    if len(idx) != 3:
+        raise ValueError(f"finals {fin}: need exactly three positive counts")
+    sub = S[np.ix_(idx, idx)]
+    out = []
+    for h in range(3):
+        m = sub[h] == sub[h].min()
+        out.append(float(m[h] and m.sum() == 1) if ties == "wrong" else m[h] / m.sum())
+    return float(np.mean(out))
+
+
 def reversal(S: np.ndarray, fin: np.ndarray) -> float:
     """Adjacent pairs (|final difference| = 1): both S[h,e] > S[h,h] and S[e,h] > S[e,e] (strict)."""
     r = [float(S[h, e] > S[h, h] and S[e, h] > S[e, e])
@@ -130,7 +144,8 @@ def endpoints(mats: list[np.ndarray], items: list[dict], ties: str = "wrong") ->
     per = []
     for S, it in zip(mats, items):
         fin = finals(it)
-        per.append({"seed": it["seed"], "n0": it["n0"], "ident": ident(S, ties), "reversal": reversal(S, fin),
+        per.append({"seed": it["seed"], "n0": it["n0"], "ident": ident(S, ties), "ident_pos": ident_pos(S, fin, ties),
+                    "reversal": reversal(S, fin),
                     "magnitude": magnitude(S, it["histories"]), "margins": margins(S, fin)})
     return per
 
@@ -150,7 +165,7 @@ def summarize(per: list[dict], n_boot: int = 2000, seed: int = 0) -> dict:
         return float(np.mean(vals))
 
     out = {}
-    for key in ("ident", "reversal", "magnitude"):
+    for key in ("ident", "ident_pos", "reversal", "magnitude"):
         est = stat(key, strata)
         boots = [stat(key, {n: [ps[i] for i in rng.integers(0, len(ps), len(ps))] for n, ps in strata.items()})
                  for _ in range(n_boot)]
@@ -195,6 +210,7 @@ ORACLES = {
     "last_transfer": lambda m, n0: tuple(m["route"][1]),
     "sign": lambda m, n0: int(np.sign(m["final"] - n0)),
     "count": lambda m, n0: m["final"],
+    "empty_nonempty": lambda m, n0: m["final"] > 0,
 }
 
 

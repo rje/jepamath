@@ -36,16 +36,19 @@ from jepagen.limiter import RenderLimiter  # noqa: E402
 from jepagen.run import run_episodes_batched  # noqa: E402
 from jepagen.sampler import (RESERVE_Z, Manifest, Template, _place_in, _project, _size_for, _volume,  # noqa: E402
                              _z_extent, load_yaml, sample_episode)
-from jepagen.spec import Episode, ObjectSpec, Transfer  # noqa: E402
+from jepagen.spec import Episode, ObjectSpec, ScreenMove, Transfer  # noqa: E402
 from jepagen.validate import min_visible_px, validate_clip  # noqa: E402
 from jepatrain.data import downsample  # noqa: E402
-from reversal_items import BB, BH, HB, RES, _drop, box_tokens, item_checks  # noqa: E402
+from reversal_items import BB, BH, HB, RES, TUBELET, _drop, box_tokens, item_checks  # noqa: E402
 
 # (name, N, add active, remove active)
 CELLS = [("N1-", 1, 0, 0), ("N1A", 1, 1, 0), ("N1AR", 1, 1, 1),
          ("N2-", 2, 0, 0), ("N2A", 2, 1, 0), ("N2R", 2, 0, 1), ("N2AR", 2, 1, 1)]
 DONOR_COUNTS = (1, 2, 3)
 DONOR_R1, DONOR_JITTER = 0.062, 0.02      # r_c = R1/sqrt(c): 0.062, 0.044, 0.036, inside v4b's [0.035, 0.065]
+# per-count radius calibration (renderer-only pilot, 64 donors, seeds 980000-999000): measured post-reveal area
+# was 1.033 / 0.989 / 0.978 of the donor mean for 1 / 2 / 3 objects (overlap and occlusion grow with count)
+DONOR_CAL = {1: 0.984, 2: 1.0055, 3: 1.011}
 
 
 def base_ok(ep: Episode) -> bool:
@@ -53,6 +56,46 @@ def base_ok(ep: Episode) -> bool:
     return (m["visibility"] == "occluded" and m["op"] == "add" and m["k"] == 1 and m["shuffles"] == 1
             and m["n0"] == 2 and m["n_hopper"] == 1 and not ep.glides and ep.violation is None
             and sum(isinstance(a, Transfer) for a in ep.actions) == 2)
+
+
+def retime(base: Episode) -> Episode:
+    """Move the reveal later so BOTH transfers, releases included, end inside the model's context: the first
+    context-boundary frame (a tubelet multiple) is at least 1.5 frames after the second transfer's end, and the
+    screen starts lowering just after it (same lowering duration). Astra review, 26 Nov: with the stock timeline
+    the second release fell after the last context frame in 42/49 pilot histories. Applied to every base, sources
+    and donors alike, so the timelines stay comparable for pairing."""
+    fps = base.clip.fps
+    t2 = max(a.t_end for a in base.actions if isinstance(a, Transfer))
+    ctx = math.ceil((t2 * fps + 1.5) / TUBELET) * TUBELET
+    acts = []
+    for a in base.actions:
+        if isinstance(a, ScreenMove) and a.kind == "screen_lower":
+            dur = a.t_end - a.t_start
+            start = max(a.t_start, ctx / fps + 0.01)
+            a = a.model_copy(update={"t_start": start, "t_end": start + dur})
+        acts.append(a.model_dump())
+    return Episode.model_validate({**base.model_dump(), "actions": acts})
+
+
+def rescale_sources(base: Episode, rng, radius_range=(0.035, 0.065), jitter=0.1) -> Episode:
+    """An independent per-scene object scale (the stock area mode sizes objects for the base's final count, which
+    is stale once routes change): base radius ~ U(radius_range), per-object jitter, box and hopper objects
+    re-placed for their new sizes."""
+    b = float(rng.uniform(*radius_range))
+    objs, new = base.objects, []
+    radii = {o.id: float(np.clip(b * rng.uniform(1 - jitter, 1 + jitter), *radius_range)) for o in objs}
+    sizes = {o.id: _size_for(o.shape, radii[o.id]) for o in objs}
+    pos = {}
+    for region, tray in (("box", base.scene.box), ("hopper", base.scene.hopper)):
+        ids = [o.id for o in objs if o.start_region == region]
+        for i, pp in zip(ids, _place_in(rng, tray, [(objs[i].shape, sizes[i], radii[i]) for i in ids])):
+            pos[i] = pp
+    for o in objs:
+        o2 = o.model_copy(update={"size": sizes[o.id], "mass": float(_volume(o.shape, sizes[o.id]) * 600)})
+        o2 = o2.model_copy(update={"start_pos": pos[o.id]}) if o.id in pos else _to_reserve(o2)
+        new.append(o2)
+    return Episode.model_validate({**base.model_dump(), "objects": [o.model_dump() for o in new],
+                                   "meta": dict(base.meta, base_radius=b, control_mode="c6_source_scale")})
 
 
 def _to_reserve(o: ObjectSpec) -> ObjectSpec:
@@ -81,8 +124,9 @@ def _net(routes) -> tuple[int, int, str, int]:
 
 def make_sources(base: Episode, seed: int) -> tuple[dict[str, Episode], bool]:
     rng = np.random.default_rng([seed, 66])
+    base = rescale_sources(retime(base), rng)
     hints = [{"box": _drop(rng, base.scene.box), "hopper": _drop(rng, base.scene.hopper)} for _ in range(2)]
-    add_first = bool(rng.integers(2))
+    add_first = bool(seed % 2)            # deterministic, so the two slot orders come out near half and half
     box_ids = [o.id for o in base.objects if o.start_region == "box"]
     drop_id = int(rng.choice(box_ids))
     out = {}
@@ -101,6 +145,7 @@ def make_sources(base: Episode, seed: int) -> tuple[dict[str, Episode], bool]:
 def make_donors(base: Episode, seed: int) -> dict[int, Episode]:
     """Three box objects (shapes/colours from base objects that are not the hopper object), area-matched per count."""
     rng = np.random.default_rng([seed, 77])
+    base = retime(base)
     hop = [o for o in base.objects if o.start_region == "hopper"]
     others = [o for o in base.objects if o.start_region != "hopper"][:3]
     if len(others) < 3 or len(hop) != 1:
@@ -108,7 +153,7 @@ def make_donors(base: Episode, seed: int) -> dict[int, Episode]:
     hints = [{"box": _drop(rng, base.scene.box), "hopper": _drop(rng, base.scene.hopper)} for _ in range(2)]
     out = {}
     for c in DONOR_COUNTS:
-        rc = DONOR_R1 / math.sqrt(c)
+        rc = DONOR_R1 / math.sqrt(c) * DONOR_CAL[c]
         radii = [float(rc * rng.uniform(1 - DONOR_JITTER, 1 + DONOR_JITTER)) for _ in range(3)]
         sizes = [_size_for(o.shape, r) for o, r in zip(others, radii)]
         pos = _place_in(rng, base.scene.box, [(o.shape, s, r) for o, s, r in zip(others[:c], sizes[:c], radii[:c])])
@@ -142,34 +187,72 @@ def hopper_px(ep: Episode, res: int, patch: int) -> tuple[np.ndarray, np.ndarray
     return m, binary_dilation(m, iterations=patch) & ~m
 
 
-def masked_carry_checks(clips: dict, ctx_model: int, n_model: int) -> list[str]:
-    """Each object carried during the context must stay visible OUTSIDE the hopper mask, at native resolution
-    with the mask scaled from the model's, on some context frame (model frame index < ctx_model)."""
-    reasons = []
-    for k, c in clips.items():
-        ep = c.episode
-        W = ep.clip.width
-        m, _ = hopper_px(ep, W, max(1, 8 * W // RES))
-        mv = min_visible_px(W, ep.clip.height)
-        times = ep.clip.frame_times()
-        n_ctx_native = int(round(ctx_model * len(times) / n_model))
-        ev = c.events
-        grasps = [(e["t"], e["object_id"]) for e in ev if e["event"] == "grasp"]
-        rels = [e["t"] for e in ev if e["event"] == "release"]
-        for (tg, oid), tr in zip(grasps, rels):
-            seen = [int(((c.seg[i] == oid + 1) & ~m).sum()) for i, t in enumerate(times)
-                    if tg <= t <= tr and i < n_ctx_native]
-            if seen and max(seen) < mv:
-                reasons.append(f"{k}: object {oid} carried {tg:.2f}-{tr:.2f}s hidden by the hopper mask "
-                               f"({max(seen)} px outside it)")
-    return reasons
+def _tray_px(ep: Episode, tray, res: int) -> np.ndarray:
+    c = ep.clip
+    pt = np.array([(tray.center[0], tray.center[1], tray.wall_height)])
+    ndc = _project(ep.scene.camera, c.width / c.height, pt)[0]
+    return np.array([(ndc[0] + 1) / 2 * res, (1 - ndc[1]) / 2 * res])
 
 
-def ending_area(clip, first_native: int) -> float:
-    """Mean box-object seg pixels (ids that start in the box) over the post-reveal frames (native resolution)."""
+def transfer_records(clip, ctx: int) -> tuple[list[dict], list[str]]:
+    """Per transfer, from the simulation itself: grasped object, its region just before the grasp and once settled
+    after the release (must equal the scheduled src / dst), and at MODEL resolution (128 px, hopper mask applied)
+    the carried object's pixels outside the mask over the context frames of the carry, plus the image positions
+    where it is first and last seen (must be nearer the src / dst tray than the other tray)."""
+    ep, st = clip.episode, clip.states
+    times = np.array([s.t for s in st])
+    s_ = clip.seg.shape[1] // RES
+    seg = clip.seg[:, ::s_, ::s_]
+    m, _ = hopper_px(ep, RES, 8)
+    mv = min_visible_px(RES, RES)
+    trays = {"box": _tray_px(ep, ep.scene.box, RES), "hopper": _tray_px(ep, ep.scene.hopper, RES)}
+    tr = [a for a in ep.actions if isinstance(a, Transfer)]
+    grasps = [(e["t"], e["object_id"]) for e in clip.events if e["event"] == "grasp"]
+    rels = [e["t"] for e in clip.events if e["event"] == "release"]
+    reasons, recs = [], []
+    if len(grasps) != len(tr) or len(rels) != len(tr):
+        return [], [f"{len(grasps)} grasps / {len(rels)} releases for {len(tr)} transfers"]
+    for k, (a, (tg, oid), trl) in enumerate(zip(tr, grasps, rels)):
+        before = [s for s in st if s.t < tg][-1]
+        after = [s for s in st if s.t >= trl + 0.3]
+        reg0 = next(o["region"] for o in before.objects if o["id"] == oid)
+        reg1 = next(o["region"] for o in after[0].objects if o["id"] == oid) if after else None
+        if (reg0, reg1) != (a.src, a.dst):
+            reasons.append(f"transfer {k}: object {oid} went {reg0}->{reg1}, scheduled {a.src}->{a.dst}")
+        if trl >= ctx / ep.clip.fps - 1 / ep.clip.fps:
+            reasons.append(f"transfer {k}: release at {trl:.2f}s is not inside the context ({ctx} frames)")
+        frames = [i for i in range(min(ctx, len(seg))) if tg <= times[i] <= trl]
+        vis = [(i, (seg[i] == oid + 1) & ~m) for i in frames]
+        vis = [(i, v) for i, v in vis if v.sum() >= mv]
+        rec = {"object": int(oid), "src": a.src, "dst": a.dst, "region_before": reg0, "region_after": reg1,
+               "t_grasp": float(tg), "t_release": float(trl), "visible_frames": [i for i, _ in vis]}
+        if not vis:
+            reasons.append(f"transfer {k}: object {oid} never visible outside the hopper mask in context at 128 px")
+        else:
+            def cen(v):
+                yy, xx = np.nonzero(v)
+                return np.array([xx.mean(), yy.mean()])
+            c0, c1 = cen(vis[0][1]), cen(vis[-1][1])
+            d = lambda c, r: float(np.linalg.norm(c - trays[r]))
+            other = lambda r: "hopper" if r == "box" else "box"
+            rec.update(first_seen=c0.tolist(), last_seen=c1.tolist())
+            if a.src != a.dst:
+                if not d(c0, a.src) < d(c0, other(a.src)):
+                    reasons.append(f"transfer {k}: first seen nearer {other(a.src)} than its source {a.src}")
+                if not d(c1, a.dst) < d(c1, other(a.dst)):
+                    reasons.append(f"transfer {k}: last seen nearer {other(a.dst)} than its destination {a.dst}")
+        recs.append(rec)
+    return recs, reasons
+
+
+def patch_coverage(clip, first_model: int) -> np.ndarray:
+    """[16, 16] mean fraction of each model patch covered by box-start objects over the post-reveal frames
+    (128 px seg)."""
     ids = [o.id + 1 for o in clip.episode.objects if o.start_region == "box"]
-    fr = clip.seg[first_native:]
-    return float(np.isin(fr, ids).sum((1, 2)).mean()) if len(fr) else 0.0
+    s_ = clip.seg.shape[1] // RES
+    seg = clip.seg[first_model:, ::s_, ::s_]
+    cov = np.isin(seg, ids).astype(float).mean(0)
+    return cov.reshape(16, 8, 16, 8).mean((1, 3))
 
 
 def main():
@@ -219,8 +302,15 @@ def main():
                     reasons.append(f"timing differs between groups: {inf} vs {info}")
                 info = info or inf
             n_frames = next(iter(clips.values())).frames.shape[0]
-            if a.role == "source" and not reasons:
-                reasons += masked_carry_checks(clips, info["ctx"], n_frames)
+            trecs = {}
+            if not reasons:
+                for k in clips:
+                    tr_, r3 = transfer_records(clips[k], info["ctx"])
+                    trecs[str(k)] = tr_
+                    if a.role == "source":
+                        reasons += [f"{k}: {r}" for r in r3]
+                    else:   # donors: only the transfer-region and in-context checks matter (BB, BB)
+                        reasons += [f"{k}: {r}" for r in r3 if "went" in r or "not inside" in r]
             if reasons or kept >= a.n:
                 if reasons:
                     rej.write(json.dumps({"seed": seed, "reasons": reasons}) + "\n"); rej.flush()
@@ -230,16 +320,17 @@ def main():
             m, ring = hopper_px(ep0, RES, 8)
             rec = {"seed": seed, "role": a.role, "names": [str(x) for x in names], **info,
                    "n_frames": int(n_frames), "meta": {str(k): h[k].meta for k in names},
-                   "events": {str(k): clips[k].events for k in names}}
+                   "events": {str(k): clips[k].events for k in names}, "transfers": trecs}
             arrays = dict(frames=np.stack([downsample(clips[k].frames, RES) for k in names]),
                           box_tokens=box_tokens(ep0), hopper_px=m, hopper_ring=ring)
             if a.role == "source":
                 rec["add_first"] = extra
             else:
-                first_native = info["ctx"] + info["first_post_slot"] * 4
-                rec["ending_area_px"] = {str(k): ending_area(clips[k], first_native) for k in names}
-                ar = list(rec["ending_area_px"].values())
-                rec["area_ratio"] = max(ar) / max(min(ar), 1e-9)
+                first_model = info["ctx"] + info["first_post_slot"] * TUBELET
+                arrays["coverage"] = np.stack([patch_coverage(clips[k], first_model) for k in names])
+                ar = arrays["coverage"].reshape(len(names), -1).sum(1)
+                rec["ending_area_px"] = {str(k): float(v) * 64 for k, v in zip(names, ar)}
+                rec["area_ratio"] = float(ar.max() / max(ar.min(), 1e-9))
             np.savez_compressed(os.path.join(a.out, f"{a.role}_{seed:09d}.npz"), **arrays)
             rec["episodes"] = {str(k): h[k].model_dump() for k in names}
             log.write(json.dumps(rec, default=float) + "\n"); log.flush()

@@ -133,3 +133,38 @@ The strongest defensible claim is behavioral. Object-file tracking, a seven-stat
 - **H-C6+:** H-C6, plus lower bound > 2/3 on mean(I, II, III).
 - **Reported:** 1-versus-3 with its reader ceilings, exact 3-way (chance 1/3), confusion, tie rate, per-slot-order results, and objlabel-100k − plain-100k and − untrained paired differences.
 - **Decisions:** as in the draft's interpretation table. A paid second 100k seed is triggered only by **H-C6+** on valid items.
+
+## Pre-registration v2 (26 Nov, after Astra's code review; still before any trained checkpoint saw a C6 item)
+
+This version supersedes v1 where they differ.
+
+1. **Timeline.**
+   - **Problem:** with the stock timeline, the second release fell *after* the last context frame in 42 of 49 pilot histories. The model often could not see where the second object went.
+   - **Fix:** `retime()` moves the reveal so both transfers, releases included, end at least 1.5 frames inside the context. Every source now has ctx = 24 and its first post-reveal slot at 1.
+   - **Caveat:** the C1–C5 reversal items used the stock timeline. Their second-transfer destination was often only partly visible in context, which limits what those results can show about the second transfer.
+2. **Source sizes.** Each source scene draws its object scale independently, U(0.035, 0.065) with ±10% jitter, instead of inheriting the stock area-mode scale.
+3. **Checks from the simulator, at model resolution.** Generator rejection totals are recorded in the manifest.
+   - **Transfers:** each transfer's actual pre-grasp and settled post-release region must equal its schedule.
+   - **Releases:** both releases must fall inside the context.
+   - **Visibility:** each carried object must be visible outside the hopper mask at 128 px in context, first seen nearer its source tray and last seen nearer its destination tray (when they differ).
+   - **State counter:** it is scored from the *simulated* finals, and the scorer refuses any block whose simulated and scheduled finals differ.
+4. **Donor area.**
+   - **Per-count calibration:** radius factors of 0.984, 1.0055 and 1.011 for 1, 2 and 3 objects, from a 64-donor renderer-only pilot.
+   - **Result on fresh seeds (1.80–1.85M, 64 donors):** relative area 0.995, 0.993 and 1.012, each with SE about 0.009.
+   - **Pairing gate:** area matching (≤ 1.20) is enforced on each pair's **common patches**, from post-reveal coverage at 128 px.
+5. **Registered shortcut readers.** Each is scored under three frozen rules: nearest, farthest, and nearest with the binary answer inverted.
+   - The readers are `meta_area`, `meta_volume` (signed volume, from the simulated transfers), `pixel_last_ctx` and `pixel_first`. The pixel readers use L1 to the donor's temporal-mean post-reveal image.
+   - The validity gate (upper bound < 0.55 on mean(I, II)) and the paired-advantage gate (lower bound > 0) apply to **every reader × rule**.
+6. **Count-equivalent positive control.** Astra's size-normalised quantity reader divides source area by the carried object's area, and reads donor count as (R1 / largest radius)². It scores 1.0, like the state counter.
+   - Under area matching, "count" and "size-normalised quantity" are the same thing. **The claim is narrowed to tracking of the hidden count, or an equivalent size-normalised quantity.**
+   - Because parity passes H-C6+, **H-C6+ supports replicating joint middle-versus-extremes sensitivity. It does not identify the algorithm.**
+7. **Ties.**
+   - One tie predicate (|d − min| ≤ 1e-12) for every endpoint.
+   - Confusion matrices split tied credit.
+   - Results are reported per slot order.
+   - `add_first = seed mod 2`, and the bootstrap is stratified by it.
+   - Column order is fixed at 1, 2, 3, since the target encoder never sees column position.
+8. **Freeze.**
+   - `items.jsonl` files are hashed alongside the NPZs.
+   - Donor pools: registered [1.3M, 1.7M), 800 accepted; top-up [1.7M, 1.8M) only if fewer than 360 pairs.
+   - `c6_manifest.py` refuses to freeze below 360 pairs. Between 360 and 399 pairs, all matches are used.

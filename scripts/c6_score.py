@@ -52,8 +52,16 @@ assert [CELLS[i][0] for i in COMP["III"]] == ["N2-", "N2A", "N2R", "N2AR"]
 
 # ---------------- endpoints on one block ----------------
 
+TIE_ATOL = 1e-12
+
+
+def tied(row: np.ndarray) -> np.ndarray:
+    """THE tie predicate for every endpoint: columns within TIE_ATOL of the row minimum."""
+    return np.flatnonzero(np.abs(row - row.min()) <= TIE_ATOL)
+
+
 def p_two(row: np.ndarray) -> float:
-    m = np.flatnonzero(np.isclose(row, row.min(), rtol=0, atol=1e-12))
+    m = tied(row)
     return float(1 in m) / len(m)
 
 
@@ -64,22 +72,23 @@ def block_endpoints(S: np.ndarray) -> dict[str, float]:
 
     def ext(i):
         t, o = (0, 2) if FIN[i] == 1 else (2, 0)
-        return 0.5 if math.isclose(S[i, t], S[i, o], abs_tol=1e-12) else float(S[i, t] < S[i, o])
+        return 0.5 if abs(S[i, t] - S[i, o]) <= TIE_ATOL else float(S[i, t] < S[i, o])
     out["1v3"] = 0.5 * np.mean([ext(i) for i in ONE]) + 0.5 * np.mean([ext(i) for i in THREE])
-    out["exact"] = float(np.mean([(np.sum(np.isclose(S[i], S[i].min(), atol=1e-12)) == 1 and S[i].argmin() == FIN[i] - 1)
-                                  for i in range(7)]))
-    out["tie_rate"] = float(np.mean([np.sum(np.isclose(S[i], S[i].min(), atol=1e-12)) > 1 for i in range(7)]))
+    out["exact"] = float(np.mean([len(tied(S[i])) == 1 and S[i].argmin() == FIN[i] - 1 for i in range(7)]))
+    out["tie_rate"] = float(np.mean([len(tied(S[i])) > 1 for i in range(7)]))
     out["mean_I_II"] = (out["I"] + out["II"]) / 2
     out["mean_I_III"] = (out["I"] + out["II"] + out["III"]) / 3
     return out
 
 
-def confusion(mats: list[np.ndarray]) -> list[list[int]]:
-    c = np.zeros((3, 3), int)
+def confusion(mats: list[np.ndarray]) -> list[list[float]]:
+    """[true final, chosen ending], tied minima sharing one row's credit equally."""
+    c = np.zeros((3, 3))
     for S in mats:
         for i in range(7):
-            c[FIN[i] - 1, int(S[i].argmin())] += 1
-    return c.tolist()
+            m = tied(S[i])
+            c[FIN[i] - 1, m] += 1 / len(m)
+    return c.round(2).tolist()
 
 
 def bootstrap(per_block: dict[str, list[dict]], strata: np.ndarray, n: int = 10_000, seed: int = 0,
@@ -162,23 +171,84 @@ def reader_ceilings(add_first_list: list[bool]) -> dict:
 
 def _r(o: dict) -> float:
     s = o["size"]
-    return {"sphere": s[0], "box": s[0] / 0.8, "cylinder": s[0]}[o["shape"]]
+    if o["shape"] in ("sphere", "cylinder"):
+        return s[0]
+    if o["shape"] == "box":
+        return s[0] / 0.8
+    raise ValueError(f"unknown shape {o['shape']}")
+
+
+def _vol(o: dict) -> float:
+    s = o["size"]
+    if o["shape"] == "sphere":
+        return 4 / 3 * math.pi * s[0] ** 3
+    if o["shape"] == "box":
+        return 8 * s[0] * s[1] * s[2]
+    if o["shape"] == "cylinder":
+        return 2 * math.pi * s[0] ** 2 * s[1]
+    raise ValueError(f"unknown shape {o['shape']}")
+
+
+def _signed(src: dict, nm: str, f) -> float:
+    """Quantity f summed over the box's starting objects, plus/minus f of each object actually carried in/out
+    (from the simulated transfer records)."""
+    ep = src["episodes"][nm]
+    objs = {o["id"]: o for o in ep["objects"]}
+    q = sum(f(o) for o in ep["objects"] if o["start_region"] == "box")
+    for t in src["transfers"][nm]:
+        q += ((t["region_after"] == "box") - (t["region_before"] == "box")) * f(objs[t["object"]])
+    return q
+
+
+def meta_volume_matrix(src: dict, don: dict) -> np.ndarray:
+    pred = [_signed(src, nm, _vol) for nm in src["names"]]
+    tgt = [sum(_vol(o) for o in don["episodes"][nm]["objects"] if o["start_region"] == "box") for nm in don["names"]]
+    return np.abs(np.array(pred)[:, None] - np.array(tgt)[None])
+
+
+def count_equiv_matrix(src: dict, don: dict) -> np.ndarray:
+    """Astra's size-normalised quantity reader (positive control, NOT a shortcut): source area / the carried
+    object's area vs donor (R1 / largest radius)^2. Under area matching it recovers the count."""
+    from c6_items import DONOR_R1
+    pred = []
+    for nm in src["names"]:
+        ep = src["episodes"][nm]
+        objs = {o["id"]: o for o in ep["objects"]}
+        unit = math.pi * _r(objs[src["transfers"][nm][0]["object"]]) ** 2
+        pred.append(_signed(src, nm, lambda o: math.pi * _r(o) ** 2) / unit)
+    tgt = [(DONOR_R1 / max(_r(o) for o in don["episodes"][nm]["objects"] if o["start_region"] == "box")) ** 2
+           for nm in don["names"]]
+    return np.abs(np.array(pred)[:, None] - np.array(tgt)[None])
+
+
+def actual_finals(src: dict) -> np.ndarray:
+    """Finals from the simulated transfers (independent of the schedule): N + carried in - carried out."""
+    return np.array([src["meta"][nm]["n0"] + sum((t["region_after"] == "box") - (t["region_before"] == "box")
+                                                 for t in src["transfers"][nm]) for nm in src["names"]])
+
+
+DIRECTIONS = ("nearest", "farthest", "inverted")
+
+
+def directed(S: np.ndarray, d: str) -> dict:
+    """Endpoints of a shortcut reader under each frozen decision rule: nearest ending, farthest ending, and the
+    nearest rule with the binary 'is 2' answer inverted (I-III only; 1v3/exact are reported for nearest only)."""
+    if d == "nearest":
+        return block_endpoints(S)
+    if d == "farthest":
+        return block_endpoints(-S)
+    e = block_endpoints(S)
+    for k in ("I", "II", "III"):
+        e[k] = 1 - e[k]
+    e["mean_I_II"] = (e["I"] + e["II"]) / 2
+    e["mean_I_III"] = (e["I"] + e["II"] + e["III"]) / 3
+    return e
 
 
 def meta_area_matrix(src: dict, don: dict) -> np.ndarray:
     """Initial box-object area + signed area of each object carried in (HB) / out (BH), vs donor ending area
     (sum of pi r^2 of the box objects): the area-tracking reader the area matching is meant to defeat."""
-    pred = []
-    for nm in src["names"]:
-        ep = src["episodes"][nm]
-        objs = {o["id"]: o for o in ep["objects"]}
-        a0 = sum(math.pi * _r(o) ** 2 for o in ep["objects"] if o["start_region"] == "box")
-        grasps = [e["object_id"] for e in src["events"][nm] if e["event"] == "grasp"]
-        tr = [a for a in ep["actions"] if a.get("kind") == "transfer"]
-        for oid, t in zip(grasps, tr):
-            d = (t["dst"] == "box") - (t["src"] == "box")
-            a0 += d * math.pi * _r(objs[oid]) ** 2
-        pred.append(a0)
+    pred = [_signed(src, nm, lambda o: math.pi * _r(o) ** 2) for nm in src["names"]]
     tgt = [sum(math.pi * _r(o) ** 2 for o in don["episodes"][nm]["objects"] if o["start_region"] == "box")
            for nm in don["names"]]
     return np.abs(np.array(pred)[:, None] - np.array(tgt)[None])
@@ -250,33 +320,43 @@ def main():
     if not (len(a.run) == len(a.weights) == len(a.name)):
         raise SystemExit("--run/--weights/--name must pair up")
     man = json.load(open(a.manifest))
+    for d_, h in man["items_sha256"].items():
+        if hashlib.sha256(open(os.path.join(d_, "items.jsonl"), "rb").read()).hexdigest() != h:
+            raise SystemExit(f"{d_}/items.jsonl changed since the manifest was frozen")
     srec = {json.loads(l)["seed"]: json.loads(l) for l in open(os.path.join(man["sources_dir"], "items.jsonl"))}
-    drec = {json.loads(l)["seed"]: json.loads(l) for l in open(os.path.join(man["donors_dir"], "items.jsonl"))}
+    drec = {json.loads(l)["seed"]: json.loads(l) for dd in man["donors_dirs"] for l in open(os.path.join(dd, "items.jsonl"))}
     blocks = []
     for p in man["pairs"]:
         sp = os.path.join(man["sources_dir"], f"source_{p['source']:09d}.npz")
-        dp = os.path.join(man["donors_dir"], f"donor_{p['donor']:09d}.npz")
+        dp = os.path.join(p["donor_dir"], f"donor_{p['donor']:09d}.npz")
         for path, h in ((sp, p["source_sha256"]), (dp, p["donor_sha256"])):
             if hashlib.sha256(open(path, "rb").read()).hexdigest() != h:
                 raise SystemExit(f"{path} changed since the manifest was frozen")
         s, d = srec[p["source"]], drec[p["donor"]]
         if s["names"] != [c[0] for c in CELLS] or [int(x) for x in d["names"]] != [1, 2, 3]:
             raise SystemExit(f"block {p['source']}/{p['donor']}: unexpected row/column order")
-        if [s["meta"][n]["final"] for n in s["names"]] != FIN.tolist():
-            raise SystemExit(f"source {p['source']}: finals {[s['meta'][n]['final'] for n in s['names']]}")
+        if [s["meta"][n]["final"] for n in s["names"]] != FIN.tolist() or actual_finals(s).tolist() != FIN.tolist():
+            raise SystemExit(f"source {p['source']}: scheduled {[s['meta'][n]['final'] for n in s['names']]}, "
+                             f"simulated {actual_finals(s).tolist()}")
         blocks.append((p, s, d, sp, dp))
     strata = np.array([s["add_first"] for _, s, _, _, _ in blocks])
     res = {"manifest": a.manifest, "n_blocks": len(blocks), "add_first": {str(k): int((strata == k).sum()) for k in (True, False)},
            "reader_ceilings": reader_ceilings(list(strata)), "models": {}}
-    per = {"state_counter": [block_endpoints(-np.eye(3)[FIN - 1]) for _ in blocks]}
-    sc = {"meta_area": [], "pixel_last_ctx": [], "pixel_first": []}
+    # the state counter scores the simulated finals (actual_finals), so a mis-executed transfer would show here
+    per = {"state_counter": [block_endpoints(-np.eye(3)[actual_finals(s) - 1]) for _, s, _, _, _ in blocks],
+           "count_equiv": []}
+    sc = {f"{r}:{d_}": [] for r in ("meta_area", "meta_volume", "pixel_last_ctx", "pixel_first") for d_ in DIRECTIONS}
     for p, s, d, sp, dp in blocks:
         zs, zd = np.load(sp), np.load(dp)
         xs = mask_hopper(zs["frames"], zs["hopper_px"], zs["hopper_ring"], s["ctx"])
-        sc["meta_area"].append(block_endpoints(meta_area_matrix(s, d)))
-        for mode in ("last_ctx", "first"):
-            sc[f"pixel_{mode}"].append(block_endpoints(pixel_matrix(xs, zd["frames"], s["ctx"], s["first_post_slot"],
-                                                                    np.array(p["common"]), mode)))
+        common = np.array(p["common"])
+        mats = {"meta_area": meta_area_matrix(s, d), "meta_volume": meta_volume_matrix(s, d),
+                "pixel_last_ctx": pixel_matrix(xs, zd["frames"], s["ctx"], s["first_post_slot"], common, "last_ctx"),
+                "pixel_first": pixel_matrix(xs, zd["frames"], s["ctx"], s["first_post_slot"], common, "first")}
+        for r, M in mats.items():
+            for d_ in DIRECTIONS:
+                sc[f"{r}:{d_}"].append(directed(M, d_))
+        per["count_equiv"].append(block_endpoints(count_equiv_matrix(s, d)))
     per.update(sc)
     torch.set_num_threads(16)
     for run, w, name in zip(a.run, a.weights, a.name):
@@ -292,9 +372,12 @@ def main():
         np.savez_compressed(os.path.splitext(a.out)[0] + f"_{name}_mats.npz", mats=np.stack(mats),
                             source=np.array([p["source"] for p, *_ in blocks]), donor=np.array([p["donor"] for p, *_ in blocks]))
         print(f"[{name}] " + "  ".join(f"{k} {np.mean([b[k] for b in per[name]]):.3f}" for k in per[name][0]), flush=True)
+        del mats
     pairs = [(m, s_) for m in res["models"] for s_ in sc] + \
             [(m1, m2) for m1 in res["models"] for m2 in res["models"] if m1 != m2]
     res["bootstrap"] = bootstrap(per, strata, a.boot, pairs=pairs)
+    res["by_order"] = {nm: {str(o): {k: float(np.mean([b[k] for b, st_ in zip(bl, strata) if st_ == o]))
+                                     for k in bl[0]} for o in (True, False)} for nm, bl in per.items()}
     for nm in per:
         if nm not in res["models"]:
             print(f"[reader] {nm:16s} " + "  ".join(f"{k} {res['bootstrap'][nm][k]['est']:.3f}" for k in ("I", "II", "III", "1v3", "exact")), flush=True)

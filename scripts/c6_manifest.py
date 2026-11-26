@@ -54,6 +54,8 @@ def main():
     ap.add_argument("--max-area-ratio", type=float, default=1.2)
     ap.add_argument("--min-pairs", type=int, default=360)
     ap.add_argument("--preview", action="store_true")
+    ap.add_argument("--per-order", type=int, default=0,
+                    help="keep exactly this many pairs per slot order (lowest source seeds first); 0 = all")
     a = ap.parse_args()
     if not a.preview and os.path.exists(a.out):
         raise SystemExit(f"{a.out} exists: the manifest is frozen once written")
@@ -78,6 +80,14 @@ def main():
             W[i, j] = iou
     r, c = linear_sum_assignment(np.where(W >= 0, W, -1e3), maximize=True)
     pairs = [(i, j) for i, j in zip(r, c) if W[i, j] >= 0]
+    if a.per_order:
+        kept = []
+        for o in (True, False):
+            po = sorted([(i, j) for i, j in pairs if S[i]["add_first"] == o], key=lambda t: S[t[0]]["seed"])
+            if len(po) < a.per_order:
+                raise SystemExit(f"slot order {o}: only {len(po)} pairs < {a.per_order}: render the registered top-up")
+            kept += po[:a.per_order]
+        pairs = kept
     used = {i for i, _ in pairs}
     summary = {"n_sources": len(S), "n_donors": len(D), "n_pairs": len(pairs),
                "compatible_pairs_failing_area": area_fail,

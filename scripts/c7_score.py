@@ -125,6 +125,7 @@ def main():
            "symbolic_edge_ceilings": symbolic_edge_ceilings(), "models": {}}
     per = {"state_counter": [edge_scores(actual_finals(s).astype(float)) for _, s, _, _, _ in blocks]}
     readers = {f"{r}:{d_}": [] for r in ("meta_area", "meta_volume", "pixel_last_ctx", "pixel_first") for d_ in ("pos", "neg")}
+    readers["pixel_area:pos"] = []
     for p, s, d, sp, dp in blocks:
         zs, zd = np.load(sp), np.load(dp)
         xs = mask_hopper(zs["frames"], zs["hopper_px"], zs["hopper_ring"], s["ctx"])
@@ -135,6 +136,10 @@ def main():
         for r, M in mats.items():   # 'pos': nearest-distance preference; 'neg': its reversal (farthest / inverted)
             readers[f"{r}:pos"].append(edge_scores(pref(M)))
             readers[f"{r}:neg"].append(edge_scores(-pref(M)))
+        # visible-area reader: any count-monotone source matched on the donor's PIXEL area (common patches) gets an
+        # edge right exactly when the 3-object ending covers more pixels; p = final x log(pix3 / pix1)
+        cov = zd["coverage"].reshape(3, -1)[:, common].sum(1)
+        readers["pixel_area:pos"].append(edge_scores(actual_finals(s) * np.log(cov[2] / cov[0])))
     per.update(readers)
     torch.set_num_threads(16)
     for run, w, name in zip(a.run, a.weights, a.name):

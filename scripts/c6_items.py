@@ -142,6 +142,9 @@ def make_sources(base: Episode, seed: int) -> tuple[dict[str, Episode], bool]:
     return out, add_first
 
 
+AREA_JITTER = 0.0     # C8: half-width of the uniform log metadata-area offset between the 3- and 1-object endings
+
+
 def make_donors(base: Episode, seed: int) -> dict[int, Episode]:
     """Three box objects (shapes/colours from base objects that are not the hopper object), area-matched per count."""
     rng = np.random.default_rng([seed, 77])
@@ -152,8 +155,13 @@ def make_donors(base: Episode, seed: int) -> dict[int, Episode]:
         raise ValueError(f"{base.episode_id}: need 3 non-hopper objects and 1 hopper object")
     hints = [{"box": _drop(rng, base.scene.box), "hopper": _drop(rng, base.scene.hopper)} for _ in range(2)]
     out = {}
+    # C8 (AREA_JITTER > 0): halfway calibration (pixel-matched and metadata-matched sit at the two ends) plus a random
+    # log metadata-area offset delta ~ U(-J, J) split between the 1- and 3-object endings, so the sign of either
+    # area asymmetry varies across donors instead of always favouring one ending
+    delta = float(rng.uniform(-AREA_JITTER, AREA_JITTER)) if AREA_JITTER > 0 else 0.0
     for c in DONOR_COUNTS:
-        rc = DONOR_R1 / math.sqrt(c) * DONOR_CAL[c]
+        cal = math.sqrt(DONOR_CAL[c]) if AREA_JITTER > 0 else DONOR_CAL[c]
+        rc = DONOR_R1 / math.sqrt(c) * cal * math.exp(delta / 4 * (c - 2))
         radii = [float(rc * rng.uniform(1 - DONOR_JITTER, 1 + DONOR_JITTER)) for _ in range(3)]
         sizes = [_size_for(o.shape, r) for o, r in zip(others, radii)]
         pos = _place_in(rng, base.scene.box, [(o.shape, s, r) for o, s, r in zip(others[:c], sizes[:c], radii[:c])])
@@ -164,7 +172,7 @@ def make_donors(base: Episode, seed: int) -> dict[int, Episode]:
         objs.append(hop[0].model_copy(update={"id": 3}))
         routes = (BB, BB)
         meta = dict(base.meta, n0=c, op="none", k=0, final=c, shuffles=2, n_in=0, n_out=0, n_hopper=1,
-                    route=[list(x) for x in routes], scene_seed=seed, donor_radii=radii[:c], base_radius=rc,
+                    route=[list(x) for x in routes], scene_seed=seed, donor_radii=radii[:c], base_radius=rc, area_delta=delta,
                     control_mode="area_matched_c6")
         out[c] = _with(base, objs, routes, hints, meta, f"c6d-{seed:09d}-{c}")
     return out
@@ -264,7 +272,10 @@ def main():
     ap.add_argument("--n", type=int, required=True, help="accepted scenes wanted")
     ap.add_argument("--max-render-fps", type=float, default=60.0)
     ap.add_argument("--batch", type=int, default=8, help="scenes per GPU submission")
+    ap.add_argument("--area-jitter", type=float, default=0.0, help="C8 donors: log metadata-area offset half-width")
     a = ap.parse_args()
+    global AREA_JITTER
+    AREA_JITTER = a.area_jitter
     if os.path.exists(a.out) and os.listdir(a.out):
         raise SystemExit(f"{a.out} is not empty: refusing to append")
     os.makedirs(a.out, exist_ok=True)

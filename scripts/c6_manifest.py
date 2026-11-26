@@ -31,8 +31,18 @@ def load(d: str, role: str) -> list[dict]:
         z = np.load(path)
         out.append({"seed": r["seed"], "ctx": r["ctx"], "first": r["first_post_slot"], "T": r["n_frames"],
                     "box": z["box_tokens"].astype(bool), "cov": z["coverage"] if "coverage" in z else None,
-                    "add_first": r.get("add_first"), "path": path, "dir": d})
+                    "add_first": r.get("add_first"), "path": path, "dir": d, "meta31": meta31(r) if role == "donor" else None})
     return out
+
+
+def meta31(r: dict) -> float:
+    """log(metadata area of the 3-object ending / the 1-object ending), sum of pi r^2 of the box objects."""
+    import math
+
+    def rad(o):
+        return o["size"][0] / 0.8 if o["shape"] == "box" else o["size"][0]
+    a = [sum(math.pi * rad(o) ** 2 for o in r["episodes"][n]["objects"] if o["start_region"] == "box") for n in r["names"]]
+    return math.log(a[2] / a[0])
 
 
 def sha(p: str) -> str:
@@ -54,6 +64,9 @@ def main():
     ap.add_argument("--max-area-ratio", type=float, default=1.2)
     ap.add_argument("--min-pairs", type=int, default=360)
     ap.add_argument("--preview", action="store_true")
+    ap.add_argument("--balance-area", action="store_true",
+                    help="C8: within each slot order, equal numbers of pairs with the 3-object ending larger / smaller "
+                         "in metadata area AND in pixel area on the pair's common patches")
     ap.add_argument("--per-order", type=int, default=0,
                     help="keep exactly this many pairs per slot order (lowest source seeds first); 0 = all")
     a = ap.parse_args()
@@ -80,7 +93,28 @@ def main():
             W[i, j] = iou
     r, c = linear_sum_assignment(np.where(W >= 0, W, -1e3), maximize=True)
     pairs = [(i, j) for i, j in zip(r, c) if W[i, j] >= 0]
-    if a.per_order:
+    def signs(i, j):
+        common = S[i]["box"] & D[j]["box"]
+        pix = D[j]["cov"][:, common].sum(1)
+        return (bool(D[j]["meta31"] > 0), bool(pix[2] > pix[0]))
+    if a.balance_area:
+        if not a.per_order or a.per_order % 2:
+            raise SystemExit("--balance-area needs an even --per-order")
+        kept = []
+        for o in (True, False):
+            po = sorted([(i, j) for i, j in pairs if S[i]["add_first"] == o], key=lambda t: S[t[0]]["seed"])
+            cells = {k: [t for t in po if signs(*t) == k] for k in [(True, True), (False, False), (True, False), (False, True)]}
+            half = a.per_order // 2
+            b = min(len(cells[(True, False)]), len(cells[(False, True)]), half)
+            c = half - b
+            if len(cells[(True, True)]) < c or len(cells[(False, False)]) < c:
+                raise SystemExit(f"slot order {o}: cells {[len(v) for v in cells.values()]} (++, --, +-, -+) cannot balance "
+                                 f"{a.per_order}: render the registered top-up")
+            kept += cells[(True, True)][:c] + cells[(False, False)][:c] + cells[(True, False)][:b] + cells[(False, True)][:b]
+            print(f"slot order {o}: concordant {c}+{c}, discordant {b}+{b} (available "
+                  f"{[len(v) for v in cells.values()]})")
+        pairs = kept
+    elif a.per_order:
         kept = []
         for o in (True, False):
             po = sorted([(i, j) for i, j in pairs if S[i]["add_first"] == o], key=lambda t: S[t[0]]["seed"])

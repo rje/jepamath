@@ -619,3 +619,153 @@ def test_a_vast_outage_still_enforces_the_spend_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(sup.time, "time", fake_time)
     out = sup.run(j, p, v, FakeS3(), B2Creds("k", "s", "e"), "c", out=lambda m: None)
     assert out.startswith("stop") and "spend cap" in out and v.destroyed == [101]
+
+
+# ---------- 26 Nov, Astra's second validation of c42068f ----------
+
+def _p(tmp_path):
+    return Project(bucket="b", b2_env="", vast_env="", repo="o/r", state_dir=str(tmp_path))
+
+
+def test_one_supervisor_per_job(tmp_path):
+    with sup.job_lock(tmp_path, "t"):
+        with pytest.raises(SystemExit, match="another supervisor"):
+            with sup.job_lock(tmp_path, "t"):
+                pass
+    with sup.job_lock(tmp_path, "t"):        # released on exit
+        pass
+
+
+def test_a_signal_as_the_rent_deferral_ends_still_destroys_the_recorded_box(tmp_path, monkeypatch):
+    v = FakeVast([["running"]])
+    real = sup.provision
+
+    def prov(*a, **k):
+        real(*a, **k)                        # rented and recorded in the ledger ...
+        raise sup._Terminate("signal 15")    # ... but the signal lands before the caller sees the id
+    monkeypatch.setattr(sup, "provision", prov)
+    out = sup.run(job(watch=Watch(poll_s=0)), _p(tmp_path), v, FakeS3(), B2Creds("k", "s", "e"), "c", out=lambda m: None)
+    st = json.loads((tmp_path / "t.json").read_text())
+    assert out.startswith("stopped") and v.destroyed == [101] and st["episodes"][0]["end"]
+
+
+def test_done_is_saved_with_the_closure_even_if_a_signal_follows(tmp_path, monkeypatch):
+    s3 = FakeS3()
+    v = FakeVast([["running"]])
+    s3.put_object("b", "runs/t/heartbeat/ep000.json", json.dumps({"episode": 0, "step": 600, "exit_rc": 0, "phase": "done"}))
+    real = sup._end_episode
+
+    def end(*a, **k):
+        real(*a, **k)
+        raise sup._Terminate("signal 15")
+    monkeypatch.setattr(sup, "_end_episode", end)
+    sup.run(job(watch=Watch(poll_s=0)), _p(tmp_path), v, s3, B2Creds("k", "s", "e"), "c", out=lambda m: None)
+    assert json.loads((tmp_path / "t.json").read_text())["outcome"] == "done"
+    with pytest.raises(RuntimeError, match="already done"):      # and is never rented again
+        sup.run(job(watch=Watch(poll_s=0)), _p(tmp_path), v, s3, B2Creds("k", "s", "e"), "c", out=lambda m: None)
+
+
+def test_recover_closes_a_legacy_destroy_pending_and_adds_only_the_unbanked_time(tmp_path):
+    v = FakeVast([])
+    v.live[55] = ["running"]
+    now = time.time()
+    (tmp_path / "t.json").write_text(json.dumps({"job": "t", "spent": 1.0, "failures": 0, "outcome": None,
+        "episodes": [{"n": 0, "instance": 55, "rate": 1.0, "start": now - 7200, "end": now - 3600,
+                      "end_reason": "stalled", "max_step": 5, "destroy_pending": True}]}))
+    st = sup.State(tmp_path / "t.json", "t")
+    sup.recover(st, v, lambda m: None)
+    assert v.destroyed == [55] and not st.d["episodes"][0]["destroy_pending"]
+    assert 1.99 < st.d["spent"] < 2.01                 # 1.0 banked + the hour since, not the whole 2 h again
+
+
+def test_a_recent_unlisted_rent_blocks_recovery(tmp_path):
+    v = FakeVast([])
+    (tmp_path / "t.json").write_text(json.dumps({"job": "t", "spent": 0.0, "failures": 0, "outcome": None,
+        "renting": {"label": "cloudrun:t:ep0:x", "offer": 7, "rate": 0.3, "od": False, "time": time.time() - 60},
+        "episodes": []}))
+    with pytest.raises(sup.RentUnresolved):
+        sup.recover(sup.State(tmp_path / "t.json", "t"), v, lambda m: None)
+
+
+def test_a_pulse_failure_alone_does_not_kill_a_training_box():
+    j = job(watch=Watch(hb_stale_min=12, stall_min=20))
+    hb = {"phase": "run", "step": 900, "exit_rc": None}
+    o = obs(hb=hb, ep_step=900, t_step=10_000.0 - 60, t_pulse=10_000.0 - 60 * 60, t_hb=10_000.0 - 60)
+    assert sup.decide(o, j)[0] == "continue"
+    o = obs(hb=hb, ep_step=900, t_step=10_000.0 - 13 * 60, t_pulse=10_000.0 - 13 * 60, t_hb=10_000.0 - 13 * 60)
+    assert sup.decide(o, j)[0] == "replace_failure"
+
+
+def test_b2_read_errors_skip_the_poll_then_a_long_outage_stops(tmp_path, monkeypatch):
+    from botocore.exceptions import EndpointConnectionError
+    v = FakeVast([["running"]])
+    calls = {"n": 0}
+
+    def hb(*_a, **_k):
+        calls["n"] += 1
+        raise EndpointConnectionError(endpoint_url="https://b2")
+    monkeypatch.setattr(sup, "heartbeat", hb)
+    clock = {"t": 1_000_000.0}
+
+    def fake_time():
+        clock["t"] += 60
+        return clock["t"]
+    monkeypatch.setattr(sup.time, "time", fake_time)
+    out = sup.run(job(budget=Budget(max_spend=50, max_hours=10), watch=Watch(poll_s=0)), _p(tmp_path), v, FakeS3(),
+                  B2Creds("k", "s", "e"), "c", out=lambda m: None)
+    assert out.startswith("stop") and "B2 unreadable" in out and calls["n"] > 5 and v.destroyed == [101]
+
+
+def test_an_ambiguous_rent_failure_never_rents_a_second_box(tmp_path, monkeypatch):
+    from cloudrun.vast import VastError
+    monkeypatch.setattr(sup, "RENT_LOOKUP_WAIT_S", 0)
+
+    class V(FakeVast):
+        def search_all(self, m):
+            return [offer(id=7), offer(id=8, min_bid=0.3)]
+
+        def rent(self, offer_id, body):
+            super().rent(offer_id, body)
+            raise VastError("timeout")            # rented, but the list does not show its label (lag)
+
+        def instances(self):
+            return [{"id": i, "actual_status": "running", "label": None} for i in self.live]
+    v = V([["running"], ["running"]])
+    st = sup.State(tmp_path / "t.json", "t")
+    with pytest.raises(sup.RentUnresolved):
+        sup.provision(job(), _p(tmp_path), v, B2Creds("k", "s", "e"), "c", 0, lambda m: None, st=st)
+    assert len(v.rented) == 1 and st.d["renting"]["offer"] == 7
+
+
+def test_a_definite_rent_refusal_tries_the_next_offer(tmp_path):
+    from cloudrun.vast import VastError
+
+    class V(FakeVast):
+        def search_all(self, m):
+            return [offer(id=7), offer(id=8, min_bid=0.3)]
+
+        def rent(self, offer_id, body):
+            if offer_id == 7:
+                raise VastError("PUT /asks/7/ -> 400: no_such_ask", code=400)
+            return super().rent(offer_id, body)
+    v = V([["running"]])
+    st = sup.State(tmp_path / "t.json", "t")
+    inst, e = sup.provision(job(), _p(tmp_path), v, B2Creds("k", "s", "e"), "c", 0, lambda m: None, st=st)
+    assert e["offer"] == 8 and st.d["renting"] is None
+
+
+def test_only_the_final_pass_publishes_the_exit_status(tmp_path):
+    s3 = FakeS3()
+    s, _run, log = _syncer(tmp_path, s3)
+    log.write_text("CLOUDRUN_EXIT rc=0\n")
+    assert s.once()["exit_rc"] is None
+    assert s.once(final=True)["exit_rc"] == 0
+
+
+def test_a_peer_state_of_the_wrong_shape_is_skipped(tmp_path):
+    (tmp_path / "peer.json").write_text("[]")
+    _state(tmp_path, "a", [])
+    assert sup.failed_hosts(tmp_path, "a", out=lambda m: None) == set()
+    (tmp_path / "a.json").write_text("[]")
+    with pytest.raises(ValueError):
+        sup.failed_hosts(tmp_path, "a", out=lambda m: None)

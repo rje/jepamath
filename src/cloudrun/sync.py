@@ -8,7 +8,7 @@ CLOUDRUN_ROLLING, CLOUDRUN_KEEP_ROLLING, CLOUDRUN_ROOT (bucket key prefix), CLOU
 B2 layout under [<root>/]runs/<job>/:
   run/<relpath>           the run directory (checkpoints, logs, eval outputs)
   logs/ep<NNN>.log        tail of this episode's job log
-  heartbeat/ep<NNN>.json  {"episode", "time", "phase", "step", "exit_rc", "synced"}
+  heartbeat/ep<NNN>.json  {"episode", "time", "phase", "step", "exit_rc", "synced"}; exit_rc only from --final
 
 Keys are per episode, so nothing a dead box shipped can be read as the live box's progress.
 A local file is uploaded when its (size, mtime) changed and it has been stable for a few seconds: a
@@ -106,9 +106,14 @@ class Syncer:
             self.s3.delete_object(Bucket=self.bucket, Key=k)
         return n
 
-    def heartbeat(self, synced: int) -> dict:
+    def heartbeat(self, synced: int, final: bool = False) -> dict:
+        """exit_rc is published only by the final pass (bootstrap's finish, after the job exited): the background
+        syncer can see the CLOUDRUN_EXIT line before the final flush has shipped the last files, and the
+        supervisor destroys the box as soon as it reads an exit status."""
         text = self.log.read_bytes()[-2_000_000:].decode("utf-8", "replace") if self.log.exists() else ""
         hb = {"episode": self.ep, "time": time.time(), **parse_log(text, self.re), "synced": synced}
+        if not final:
+            hb["exit_rc"] = None
         hb["step"] = self.max_step = max(self.max_step, hb["step"])
         b2.put_bytes(self.s3, self.bucket, f"{self.base}/logs/ep{self.ep:03d}.log", text[-256_000:].encode())
         b2.put_bytes(self.s3, self.bucket, f"{self.base}/heartbeat/ep{self.ep:03d}.json", json.dumps(hb).encode())
@@ -117,7 +122,7 @@ class Syncer:
     def once(self, final: bool = False) -> dict:
         """final: the job has exited, so nothing is mid-write — ship even files modified a moment ago."""
         n = self.sync_run_dir(0.0 if final else STABLE_S)
-        return self.heartbeat(n)
+        return self.heartbeat(n, final=final)
 
 
 def main() -> int:

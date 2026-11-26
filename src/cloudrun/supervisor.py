@@ -13,7 +13,8 @@ Rules (in order):
   instance not listed / not in a running state                 -> replace (preemption; not a failure)
   started this episode, step unchanged for watch.stall_min     -> replace (failure: a wedged box bills too)
   no heartbeat and no pulse, episode older than watch.boot_min -> replace (failure: image pull / boot hung)
-  pulse seen, then unchanged for watch.hb_stale_min            -> replace (failure: box frozen or offline)
+  pulse seen, then pulse, heartbeat and step all unchanged
+    for watch.hb_stale_min                                     -> replace (failure: box frozen or offline)
   not started, episode older than watch.setup_grace_min        -> replace (failure)
   failures > watch.max_failures                                -> stop
 """
@@ -23,6 +24,7 @@ from __future__ import annotations
 import base64
 import dataclasses as dc
 import json
+import os
 import signal
 import time
 import uuid
@@ -47,6 +49,7 @@ class Obs:
     any_progress: bool          # some episode (including this one) reached step > 0
     failures: int
     t_pulse: float | None = None  # local time the liveness pulse last changed (None: never seen; cloudrun.pulse)
+    t_hb: float | None = None     # local time the syncer heartbeat's `time` last changed (None: never seen)
 
 
 def decide(o: Obs, job: Job) -> tuple[str, str]:
@@ -65,10 +68,14 @@ def decide(o: Obs, job: Job) -> tuple[str, str]:
         return "replace_failure", f"job failed rc={rc} in phase {o.hb.get('phase')}"
     if o.status is None or o.status not in RUNNING_STATES:
         return "replace", f"instance {o.status or 'gone'} (preempted?)"
-    if o.t_pulse is not None and (o.now - o.t_pulse) / 60 > w.hb_stale_min:
-        phase = (o.hb or {}).get("phase", "no heartbeat")
-        return "replace_failure", (f"pulse unchanged for {w.hb_stale_min} min (phase {phase}, step {o.ep_step}): "
-                                   f"box wedged")
+    if o.t_pulse is not None:
+        # any sign of life counts: the pulse, a fresh syncer heartbeat, or a new training step. Only when all of
+        # them have been still for hb_stale_min is the box frozen or offline (a dead pulse process alone is not).
+        signs = [t for t in (o.t_pulse, o.t_hb, o.t_step if o.ep_step > 0 else None) if t is not None]
+        if (o.now - max(signs)) / 60 > w.hb_stale_min:
+            phase = (o.hb or {}).get("phase", "no heartbeat")
+            return "replace_failure", (f"pulse, heartbeat and step unchanged for {w.hb_stale_min} min (phase {phase}, "
+                                       f"step {o.ep_step}): box wedged")
     if o.ep_step > 0:
         if (o.now - o.t_step) / 60 > w.stall_min:
             return "replace_failure", f"stalled: step {o.ep_step} unchanged for {w.stall_min} min"
@@ -180,6 +187,41 @@ class NoOffers(RuntimeError):
     pass
 
 
+class RentUnresolved(RuntimeError):
+    """A rent may have reached Vast but cannot be found by its label yet: renting another box could leave
+    two billing with one unrecorded, so the supervisor stops and st.d["renting"] is kept for the next start."""
+
+
+RENT_SETTLE_S = 600          # how long the Vast instance list may lag a rent before an absent label means "not rented"
+RENT_LOOKUP_TRIES, RENT_LOOKUP_WAIT_S = 4, 15
+
+
+class job_lock:
+    """One supervisor per job: an exclusive, non-blocking lock on <state_dir>/<job>.lock, held from before
+    recovery until the supervisor exits. A second `launch --yes` of the same job fails instead of destroying
+    the first supervisor's box or overwriting its ledger."""
+
+    def __init__(self, state_dir: Path, job: str):
+        self.path = Path(state_dir) / f"{job}.lock"
+
+    def __enter__(self):
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(self.path, "w")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.f.close()
+            raise SystemExit(f"another supervisor holds {self.path}: is `launch {self.path.stem}` already running?")
+        self.f.write(str(os.getpid()))
+        self.f.flush()
+        return self
+
+    def __exit__(self, *_):
+        self.f.close()
+        return False
+
+
 _GUARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
@@ -204,6 +246,10 @@ def recover(st: "State", vast: Vast, out) -> str | None:
     if pend:
         known = {e["instance"] for e in st.d["episodes"]}
         found = [i for i in vast.instances() if i.get("label") == pend["label"] and i.get("id") not in known]
+        if not found and time.time() - pend["time"] < RENT_SETTLE_S:
+            raise RentUnresolved(f"a rent ({pend['label']}, offer {pend['offer']}) from "
+                                 f"{(time.time() - pend['time']) / 60:.0f} min ago is not listed yet; the Vast list "
+                                 f"can lag, so wait until {RENT_SETTLE_S // 60} min have passed and launch again")
         for i in found:
             out(f"rent {pend['label']} (offer {pend['offer']}) reached Vast as instance {i['id']} but was never "
                 f"recorded: adding it to the ledger and destroying it")
@@ -215,7 +261,9 @@ def recover(st: "State", vast: Vast, out) -> str | None:
         st.save()
     outcome = None
     for e in st.d["episodes"]:
-        if e["end"] is None:
+        # destroy_pending with `end` already set is the pre-c42068f format (end and spend were banked before the
+        # failed destroy): still possibly billing, so it is destroyed too, and only the unbanked time is added
+        if e["end"] is None or e.get("destroy_pending"):
             action = e.get("pending_action")
             reason = e.get("pending_reason") or "orphaned by a previous supervisor"
             out(f"episode {e['n']} (instance {e['instance']}) was left open ({reason}); destroying it")
@@ -271,64 +319,89 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
                     time.sleep(NO_OFFER_WAIT_S)
                     continue
                 ep_step, t_step = 0, e["start"]
-                pulse_last, t_pulse = None, None
+                pulse_last, t_pulse, hb_last, t_hb = None, None, None, None
+                b2_down_since = None
             time.sleep(job.watch.poll_s)
             now = time.time()
+            running = e["rate"] * (now - e["start"]) / 3600 + e.get("bandwidth", 0.0)
+            cap = (f"spend cap: ${st.d['spent'] + running:.2f} >= ${job.budget.max_spend:.2f}"
+                   if st.d["spent"] + running >= job.budget.max_spend else
+                   f"wall-clock cap {job.budget.max_hours} h" if (now - t_start) / 3600 > job.budget.max_hours else None)
             try:
                 status, billed, bw = vast.poll(inst)
             except VastError as ex:
-                # an API hiccup is not evidence the box died; look again next poll. The caps still hold:
-                # judged from local time and the last known rate, so an outage cannot bill forever.
-                running = e["rate"] * (now - e["start"]) / 3600 + e.get("bandwidth", 0.0)
-                over = (st.d["spent"] + running >= job.budget.max_spend
-                        or (now - t_start) / 3600 > job.budget.max_hours)
-                out(f"  vast API error ({ex})" + ("; a cap is reached: tearing down" if over else "; ignored this poll"))
-                if not over:
+                # an API hiccup is not evidence the box died; look again next poll. The caps still hold, judged
+                # from local time and the last known rate, so an outage cannot bill forever.
+                out(f"  vast API error ({ex})" + (f"; {cap}: tearing down" if cap else "; ignored this poll"))
+                if not cap:
                     continue
-                status, billed, bw = "unknown", None, e.get("bandwidth", 0.0)
-            if billed is not None and billed > e["rate"]:   # account at what Vast bills, never below the bid
-                e["rate"] = billed
-            e["bandwidth"] = max(e.get("bandwidth", 0.0), bw)
-            hb = heartbeat(s3, project, job.name, ep)
-            pt = pulse(s3, project, job.name, ep)
-            if pt is not None and pt != pulse_last:
-                pulse_last, t_pulse = pt, now
-            if hb and hb.get("step", 0) > ep_step:
-                ep_step, t_step = hb["step"], now
-                e["max_step"] = ep_step
-                any_progress = True
-            running = e["rate"] * (now - e["start"]) / 3600 + e.get("bandwidth", 0.0)
-            o = Obs(now=now, t_start=t_start, ep_start=e["start"], status=status if status != "unknown" else "running",
-                    hb=hb, ep_step=ep_step, t_step=t_step, spent=st.d["spent"] + running, any_progress=any_progress,
-                    failures=st.d["failures"], t_pulse=t_pulse)
-            action, reason = decide(o, job)
-            phase = (hb or {}).get("phase", "-")
-            out(f"  [ep{ep} {(now - e['start']) / 60:5.0f}m] {status or 'gone':<8} phase {phase:<8} step {ep_step:>7} "
-                f"${o.spent:7.2f}/{job.budget.max_spend:.2f}" + (f"  -> {action}: {reason}" if reason else ""))
+                action, reason = "stop", cap
+            else:
+                if billed is not None and billed > e["rate"]:   # account at what Vast bills, never below the bid
+                    e["rate"] = billed
+                e["bandwidth"] = max(e.get("bandwidth", 0.0), bw)
+                try:
+                    hb = heartbeat(s3, project, job.name, ep)
+                    pt = pulse(s3, project, job.name, ep)
+                except B2_ERRORS as ex:
+                    # a B2 read failure says nothing about the box: no liveness rule runs this poll. The caps
+                    # still hold, and a long B2 outage stops the job (it cannot be supervised blind).
+                    b2_down_since = b2_down_since or now
+                    blind = (now - b2_down_since) / 60
+                    if not cap and blind > B2_OUTAGE_MIN:
+                        cap = f"B2 unreadable for {blind:.0f} min: cannot supervise"
+                    out(f"  B2 read error ({type(ex).__name__}: {ex})" +
+                        (f"; {cap}: tearing down" if cap else f"; blind {blind:.0f} min, ignored this poll"))
+                    if not cap:
+                        continue
+                    action, reason = "stop", cap
+                else:
+                    b2_down_since = None
+                    if pt is not None and pt != pulse_last:
+                        pulse_last, t_pulse = pt, now
+                    if hb and hb.get("time") != hb_last:
+                        hb_last, t_hb = hb.get("time"), now
+                    if hb and hb.get("step", 0) > ep_step:
+                        ep_step, t_step = hb["step"], now
+                        e["max_step"] = ep_step
+                        any_progress = True
+                    # "unknown" = listed without an actual_status yet (vast.poll): alive, the boot rules cover it
+                    o = Obs(now=now, t_start=t_start, ep_start=e["start"],
+                            status="running" if status == "unknown" else status, hb=hb, ep_step=ep_step,
+                            t_step=t_step, spent=st.d["spent"] + running, any_progress=any_progress,
+                            failures=st.d["failures"], t_pulse=t_pulse, t_hb=t_hb)
+                    action, reason = decide(o, job)
+                    phase = (hb or {}).get("phase", "-")
+                    out(f"  [ep{ep} {(now - e['start']) / 60:5.0f}m] {status or 'gone':<8} phase {phase:<8} "
+                        f"step {ep_step:>7} ${o.spent:7.2f}/{job.budget.max_spend:.2f}"
+                        + (f"  -> {action}: {reason}" if reason else ""))
             st.save()
             if action == "continue":
                 continue
-            try:
-                _end_episode(st, e, vast, inst, reason, out, action)
-            finally:
-                inst = None          # never destroyed again below; an open episode / destroy_pending carries it
+            inst = None              # the episode is in the ledger; the destroy below or `finally` closes it
+            _end_episode(st, e, vast, e["instance"], reason, out, action)
             if action in ("done", "stop"):
                 outcome = f"{action}: {reason}"
                 break
-    except DestroyFailed as ex:
+    except (DestroyFailed, RentUnresolved) as ex:
         outcome = f"stopped: {ex}"
     except _Terminate as ex:
         outcome = f"stopped: {ex}"
     except KeyboardInterrupt:
         outcome = "stopped: interrupted"
     finally:
-        if inst is not None:
+        # close EVERY episode the ledger still has open, not just the one in hand: a signal delivered as a rent's
+        # deferral ends can leave a recorded box whose instance id never reached this frame
+        for e_ in [x for x in st.d["episodes"] if x["end"] is None or x.get("destroy_pending")]:
             try:
-                _end_episode(st, e, vast, inst, outcome, out)
+                _end_episode(st, e_, vast, e_["instance"], e_.get("pending_reason") or outcome, out,
+                             e_.get("pending_action"))
             except DestroyFailed as ex:
                 outcome = f"stopped: {ex}"
-        st.d["outcome"] = "done" if outcome.startswith("done") else outcome
+        if st.d.get("outcome") is None:      # a done/stop already saved with its episode's closure stands
+            st.d["outcome"] = "done" if outcome.startswith("done") else outcome
         st.save()
+        outcome = st.d["outcome"] if st.d["outcome"] != "done" else outcome
         try:
             left = [i for i in vast.instances() if i.get("actual_status") in RUNNING_STATES]
         except VastError as ex:
@@ -345,6 +418,15 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
 
 DESTROY_TRIES, DESTROY_WAIT_S = 6, 30
 NO_OFFER_WAIT_S = 300
+B2_OUTAGE_MIN = 30
+
+
+def _b2_errors() -> tuple:
+    from botocore.exceptions import BotoCoreError, ClientError
+    return (BotoCoreError, ClientError, OSError)
+
+
+B2_ERRORS = _b2_errors()
 
 
 def _end_episode(st: State, e: dict, vast: Vast, inst: int, reason: str, out, action: str | None = None) -> None:
@@ -375,12 +457,18 @@ def _end_episode(st: State, e: dict, vast: Vast, inst: int, reason: str, out, ac
             raise DestroyFailed(f"instance {inst} could not be destroyed after {DESTROY_TRIES} tries ({err}): it may "
                                 f"still be billing. Kill it at https://cloud.vast.ai/instances/ ; the next "
                                 f"supervisor start retries it")
+        now = time.time()
         if e["end"] is None:
-            e["end"] = time.time()
+            st.d["spent"] += e["rate"] * (now - e["start"]) / 3600 + e.get("bandwidth", 0.0)
             e["end_reason"] = reason
-            st.d["spent"] += e["rate"] * (e["end"] - e["start"]) / 3600 + e.get("bandwidth", 0.0)
+        else:       # pre-c42068f destroy_pending: spend was banked to e["end"]; add only the time since
+            st.d["spent"] += e["rate"] * (now - e["end"]) / 3600
+            e["end_reason"] = f"{e.get('end_reason')}; destroy confirmed later"
+        e["end"] = now
         if action == "replace_failure":
             st.d["failures"] += 1
+        if action in ("done", "stop"):      # the job's outcome is saved in the same write as the closure
+            st.d["outcome"] = "done" if action == "done" else f"stop: {reason}"
         e["destroy_pending"] = False
         st.save()
 
@@ -401,8 +489,12 @@ def failed_hosts(state_dir: Path, job: str, now: float | None = None, hours: flo
     for f in Path(state_dir).glob("*.json"):
         own = f.stem == job
         try:
-            eps = json.loads(f.read_text()).get("episodes", [])
-        except (json.JSONDecodeError, OSError) as ex:
+            d = json.loads(f.read_text())
+            if not isinstance(d, dict) or not isinstance(d.get("episodes", []), list) \
+                    or not all(isinstance(e, dict) for e in d.get("episodes", [])):
+                raise ValueError("not a cloudrun state (expected an object with an episodes list)")
+            eps = d.get("episodes", [])
+        except (json.JSONDecodeError, OSError, ValueError) as ex:
             if own:
                 raise
             out(f"  warning: skipping unreadable state {f.name} ({ex})")
@@ -460,15 +552,28 @@ def provision(job: Job, project: Project, vast: Vast, creds: B2Creds, commit: st
                 inst = vast.rent(offer["id"], body)
             except VastError as ex:
                 inst = None
-                if st is not None:      # did it reach Vast anyway? (reply lost)
-                    try:
-                        hit = [i["id"] for i in vast.instances() if i.get("label") == label]
-                    except VastError as ex2:
-                        raise RuntimeError(f"rent of offer {offer['id']} failed ({ex}) and the instance list is "
-                                           f"unreachable ({ex2}): stopping; the next start reconciles label {label}")
-                    inst = hit[0] if hit else None
+                # A 4xx is a definite refusal (offer taken, bad bid). Anything else (network error, timeout, 5xx,
+                # odd reply) may have rented a box, and the Vast list can lag a rent, so one empty listing is
+                # not proof. Look it up by label a few times; still absent -> stop rather than rent a second box.
+                definite = ex.code is not None and 400 <= ex.code < 500
+                if st is not None:
+                    for k in range(1 if definite else RENT_LOOKUP_TRIES):
+                        try:
+                            hit = [i["id"] for i in vast.instances() if i.get("label") == label]
+                        except VastError as ex2:
+                            raise RentUnresolved(f"rent of offer {offer['id']} failed ({ex}) and the instance list "
+                                                 f"is unreachable ({ex2}); the next start reconciles label {label}")
+                        if hit:
+                            inst = hit[0]
+                            break
+                        if not definite and k + 1 < RENT_LOOKUP_TRIES:
+                            time.sleep(RENT_LOOKUP_WAIT_S)
+                    if inst is None and not definite:
+                        raise RentUnresolved(f"rent of offer {offer['id']} failed ambiguously ({ex}) and label "
+                                             f"{label} is not listed after {RENT_LOOKUP_TRIES} looks; stopping so "
+                                             f"the next start (after {RENT_SETTLE_S // 60} min) reconciles it")
                 if inst is None:
-                    out(f"  rent of offer {offer['id']} failed ({ex}); trying the next")
+                    out(f"  rent of offer {offer['id']} refused ({ex}); trying the next")
                     if st is not None:
                         st.d["renting"] = None
                         st.save()

@@ -26,7 +26,12 @@ RUNNING_STATES = frozenset({"running", "loading", "created", "starting"})
 
 
 class VastError(RuntimeError):
-    pass
+    """`code` is the HTTP status when Vast answered (a 4xx is a definite refusal), None for a network failure
+    or an unexpected reply, where the request may or may not have taken effect."""
+
+    def __init__(self, msg: str, code: int | None = None):
+        super().__init__(msg)
+        self.code = code
 
 
 class Vast:
@@ -45,7 +50,7 @@ class Vast:
                 raw = r.read().decode()
                 return json.loads(raw) if raw.strip() else {}
         except urllib.error.HTTPError as e:
-            raise VastError(f"{method} {path} -> {e.code}: {e.read().decode()[:400]}") from e
+            raise VastError(f"{method} {path} -> {e.code}: {e.read().decode()[:400]}", code=e.code) from e
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             # network failure (DNS, timeout, reset): a VastError, so the supervisor's poll loop retries it and its
             # cleanup still runs (24 Nov: an unwrapped URLError killed the supervisor and left a box running 12 h)
@@ -80,6 +85,8 @@ class Vast:
 
     def poll(self, inst: int) -> tuple[str | None, float | None, float]:
         """(actual_status, billed $/h, bandwidth $ so far) of the instance; (None, None, 0) if not listed.
+        A listed instance with no actual_status yet (Vast reports null while a fresh box is being created) is
+        "unknown"; the supervisor treats that as alive, and the boot_min / setup rules catch one that never starts.
         `dph_total` is the GPU price plus disk; bandwidth is billed separately per GB moved."""
         for i in self.instances():
             if i.get("id") == inst:

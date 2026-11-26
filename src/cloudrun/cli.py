@@ -28,7 +28,7 @@ from pathlib import Path
 from . import b2
 from .config import load_job, load_project
 from .creds import b2_from_file, read_env_file, vast_key
-from .supervisor import State, data_gb, heartbeat, run, recover
+from .supervisor import State, data_gb, heartbeat, job_lock, run, recover
 from .vast import Vast, fmt_offers, rank
 
 
@@ -57,6 +57,25 @@ def checks(job, project, s3) -> list[str]:
     return msgs
 
 
+
+def _launch(a, job, project, vast) -> int:
+    """`launch JOB --yes`, under the job lock and after recovery: the prechecks, then supervise. An empty market
+    is not an error here: run() waits and looks again (NO_OFFER_WAIT_S) within the wall-clock budget."""
+    s3 = b2.client(b2_from_file(project.b2_env))
+    commit = code_commit()
+    for m in checks(job, project, s3):
+        print(m)
+    inst_creds = b2_from_file(project.instance_b2_env or project.b2_env)
+    down_gb = data_gb(job, project, s3)
+    ranked = rank(vast.search_all(job.machine), job.machine, down_gb)
+    print(f"LAUNCH {job.name} @ {commit[:8]}: {len(ranked)} eligible offers now; hard caps "
+          f"${job.budget.max_spend:.2f} and {job.budget.max_hours} h\n  command: {job.command}")
+    if ranked:
+        print(fmt_offers(ranked, m=job.machine, down_gb=down_gb))
+    outcome = run(job, project, vast, s3, inst_creds, commit, out=lambda m: print(m, flush=True))
+    return 0 if outcome == "done" else 1
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="cloudrun", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--project", default="cloud/cloudrun.toml")
@@ -74,20 +93,31 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     project = load_project(a.project)
-    creds = b2_from_file(project.b2_env)
-    s3 = b2.client(creds)
     jobfile = lambda name: Path(a.project).parent / "jobs" / f"{name}.toml"
 
-    if a.cmd in ("offers", "plan", "launch"):
+    if a.cmd == "launch" and a.yes:
+        # one supervisor per job, locked from before recovery to exit; recovery (which may destroy boxes) runs
+        # before anything else can fail, B2 credentials included. Without --yes nothing is destroyed or rented.
         job = load_job(jobfile(a.job))
         vast = Vast(vast_key(project.vast_env))
-        if a.cmd == "launch":
-            # close anything a previous supervisor left billing before any precheck can fail
+        with job_lock(project.path(project.state_dir), job.name):
             st = State(project.path(project.state_dir) / f"{job.name}.json", job.name)
             prior = recover(st, vast, lambda m: print(m, flush=True))
             if prior:
                 print(f"{job.name}: {prior} (decided before a previous supervisor's destroy failed)")
                 return 0 if prior.startswith("done") else 1
+            return _launch(a, job, project, vast)
+
+    creds = b2_from_file(project.b2_env)
+    s3 = b2.client(creds)
+    if a.cmd in ("offers", "plan", "launch"):
+        job = load_job(jobfile(a.job))
+        vast = Vast(vast_key(project.vast_env))
+        st = State(project.path(project.state_dir) / f"{job.name}.json", job.name)
+        left = [e["instance"] for e in st.d["episodes"] if e["end"] is None or e.get("destroy_pending")]
+        if left or st.d.get("renting"):
+            print(f"NOTE: the ledger has open episode(s) {left} / an unreconciled rent {st.d.get('renting')}; "
+                  f"`launch {job.name} --yes` closes them first")
         down_gb = data_gb(job, project, s3)
         ranked = rank(vast.search_all(job.machine), job.machine, down_gb)
         print(f"{len(ranked)} eligible offers for {job.machine.gpus} x{job.machine.num_gpus} "
@@ -99,18 +129,15 @@ def main(argv=None) -> int:
         commit = code_commit()
         for m in checks(job, project, s3):
             print(m)
-        inst_creds = b2_from_file(project.instance_b2_env or project.b2_env)
+        b2_from_file(project.instance_b2_env or project.b2_env)
         if not ranked:
-            raise SystemExit("no eligible offers")
+            raise SystemExit("no eligible offers right now (a confirmed launch waits and retries)")
         rate = ranked[0][0]
         print(f"\nPLAN {job.name} @ {commit[:8]}\n  cheapest rate ${rate:.3f}/h; hard caps ${job.budget.max_spend:.2f} "
               f"and {job.budget.max_hours} h (≈ ${rate * job.budget.max_hours:.2f} if it ran the full wall clock)\n"
               f"  command: {job.command}\n  results -> s3://{project.bucket}/{project.key('runs', job.name, 'run')}/")
-        if a.cmd == "plan" or not a.yes:
-            print("\ndry run: nothing rented. `launch JOB --yes` rents.")
-            return 0
-        outcome = run(job, project, vast, s3, inst_creds, commit, out=lambda m: print(m, flush=True))
-        return 0 if outcome == "done" else 1
+        print("\ndry run: nothing rented or destroyed. `launch JOB --yes` rents.")
+        return 0
 
     if a.cmd == "status":
         st = State(project.path(project.state_dir) / f"{a.job}.json", a.job)

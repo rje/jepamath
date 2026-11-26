@@ -78,6 +78,10 @@ class Watch:
     hb_stale_min: float = 12        # heartbeat content unchanged this long (syncer writes every minute) -> replace
     poll_s: float = 60
     max_failures: int = 2           # crashes/stalls after progress before giving up
+    # 0 = off. Otherwise: once training has run for slow_window_min this episode, a step rate below this replaces
+    # the box (failure, host avoided for 24 h). 27 Nov: two on-demand hosts ran at ~1/9 of normal speed (42 clips/s)
+    min_steps_per_min: float = 0
+    slow_window_min: float = 10
 
 
 @dc.dataclass(frozen=True)

@@ -949,3 +949,16 @@ def test_malformed_host_ids_are_ignored(tmp_path):
     _state(tmp_path, "peer", [{"n": 0, "offer": 5, "machine": [], "end": time.time(), "end_reason": "boot hung"}])
     _state(tmp_path, "a", [])
     assert sup.failed_hosts(tmp_path, "a", out=lambda m: None) == {("offer", 5)}
+
+
+def test_a_slow_host_is_replaced_once_the_window_has_passed():
+    j = job(watch=Watch(min_steps_per_min=300, slow_window_min=10, stall_min=20))
+    hb = {"phase": "run", "step": 21150, "exit_rc": None}
+    slow = obs(hb=hb, ep_step=21150, t_step=10_000.0 - 30, first_step=(10_000.0 - 11 * 60, 20_600))
+    a, r = sup.decide(slow, j)
+    assert a == "replace_failure" and "slow host" in r and "no progress" in r      # failed_hosts avoids it
+    fast = obs(hb=hb, ep_step=27_000, t_step=10_000.0 - 30, first_step=(10_000.0 - 11 * 60, 20_600))
+    assert sup.decide(fast, j)[0] == "continue"
+    early = obs(hb=hb, ep_step=20_700, t_step=10_000.0 - 30, first_step=(10_000.0 - 5 * 60, 20_600))
+    assert sup.decide(early, j)[0] == "continue"                                   # window not yet passed
+    assert sup.decide(slow, job(watch=Watch(stall_min=20)))[0] == "continue"       # off by default

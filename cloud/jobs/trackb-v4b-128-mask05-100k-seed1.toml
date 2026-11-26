@@ -51,3 +51,4 @@ setup_grace_min = 40
 stall_min = 20
 poll_s = 60
 max_failures = 4   # boot hangs cost ~$0.20 each and were frequent on 23 Nov
+min_steps_per_min = 300   # normal hosts run 650-1300 steps/min; 27 Nov slow hosts ran ~80

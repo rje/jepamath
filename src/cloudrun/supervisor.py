@@ -51,6 +51,7 @@ class Obs:
     t_pulse: float | None = None  # local time the liveness pulse last changed (None: never seen; cloudrun.pulse)
     t_hb: float | None = None     # local time the syncer heartbeat's `time` last changed (None: never seen)
     pulse_unread: bool = False    # the pulse GET failed this poll: no boot-hang / wedge decision rests on it
+    first_step: tuple[float, int] | None = None   # (local time, step) when this episode's step first advanced
 
 
 def decide(o: Obs, job: Job) -> tuple[str, str]:
@@ -77,6 +78,12 @@ def decide(o: Obs, job: Job) -> tuple[str, str]:
             phase = (o.hb or {}).get("phase", "no heartbeat")
             return "replace_failure", (f"pulse, heartbeat and step unchanged for {w.hb_stale_min} min (phase {phase}, "
                                        f"step {o.ep_step}): box wedged")
+    if o.ep_step > 0 and w.min_steps_per_min > 0 and o.first_step is not None:
+        t0, s0 = o.first_step
+        mins = (o.now - t0) / 60
+        if mins >= w.slow_window_min and (o.ep_step - s0) / mins < w.min_steps_per_min:
+            return "replace_failure", (f"no progress: slow host, {(o.ep_step - s0) / mins:.0f} steps/min < "
+                                       f"{w.min_steps_per_min:.0f} over {mins:.0f} min")
     if o.ep_step > 0:
         if (o.now - o.t_step) / 60 > w.stall_min:
             return "replace_failure", f"stalled: step {o.ep_step} unchanged for {w.stall_min} min"
@@ -360,7 +367,7 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
                     time.sleep(NO_OFFER_WAIT_S)
                     continue
                 ep = e["n"]          # provision may have adopted late rents first, shifting the number
-                ep_step, t_step = 0, e["start"]
+                ep_step, t_step, first_step = 0, e["start"], None
                 pulse_last, t_pulse, hb_last, t_hb = None, None, None, None
                 b2_down_since = None
             time.sleep(job.watch.poll_s)
@@ -409,6 +416,8 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
                     if hb and hb.get("time") != hb_last:
                         hb_last, t_hb = hb.get("time"), now
                     if hb and hb.get("step", 0) > ep_step:
+                        if first_step is None:
+                            first_step = (now, hb["step"])   # resumed runs start mid-way: rate from here
                         ep_step, t_step = hb["step"], now
                         e["max_step"] = ep_step
                         any_progress = True
@@ -417,7 +426,7 @@ def run(job: Job, project: Project, vast: Vast, s3, creds: B2Creds, commit: str,
                             status="running" if status == "unknown" else status, hb=hb, ep_step=ep_step,
                             t_step=t_step, spent=st.d["spent"] + running, any_progress=any_progress,
                             failures=st.d["failures"], t_pulse=t_pulse, t_hb=t_hb,
-                            pulse_unread=pt_err is not None)
+                            pulse_unread=pt_err is not None, first_step=first_step)
                     action, reason = decide(o, job)
                     phase = (hb or {}).get("phase", "-")
                     out(f"  [ep{ep} {(now - e['start']) / 60:5.0f}m] {status or 'gone':<8} phase {phase:<8} "

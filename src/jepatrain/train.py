@@ -196,6 +196,8 @@ def _supcon_clean(e: torch.Tensor, lab: torch.Tensor, slot: torch.Tensor, tau: f
 def main():
     ap = argparse.ArgumentParser(prog="jepatrain")
     ap.add_argument("--data", default="/mnt/data/jepamath/v2")
+    ap.add_argument("--placement-data", help="frozen paired visible-placement schedule and demonstration bank")
+    ap.add_argument("--placement-arm", choices=("control", "treatment"))
     ap.add_argument("--early-data", default=None,
                     help="curriculum: train on this data for the first --early-steps steps, then on --data")
     ap.add_argument("--early-steps", type=int, default=0)
@@ -266,6 +268,9 @@ def main():
     if a.mix_data and a.early_data:
         raise SystemExit("--mix-data with a curriculum is not supported")
 
+    if bool(a.placement_data) != bool(a.placement_arm) or (a.placement_data and (a.mix_data or a.early_data or a.mask_weight)):
+        ap.error("placement schedule requires one arm and plain, unmixed training")
+
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(a.seed)
     rng = random.Random(a.seed)
@@ -315,7 +320,12 @@ def main():
                                            num_workers=a.workers, pin_memory=True, persistent_workers=True,
                                            prefetch_factor=4, multiprocessing_context=ctx)
     early = a.early_data is not None and step < a.early_steps
-    loader = make_loader(a.early_data if early else a.data)
+    if a.placement_data:
+        from .placement import PlacementBatches, placement_mask
+        batches = PlacementBatches(a.placement_data, a.data, a.placement_arm, step, a.steps, a.batch)
+        loader = torch.utils.data.DataLoader(batches, batch_size=None, num_workers=a.workers, pin_memory=True)
+    else:
+        loader = make_loader(a.early_data if early else a.data)
     it = iter(loader)
     if early:
         print(f"[train] curriculum: {a.early_data} until step {a.early_steps}, then {a.data}", flush=True)
@@ -361,7 +371,21 @@ def main():
         torch.save({"enc": enc.state_dict(), "pred": pred.state_dict(), "tgt": tgt.state_dict(), "step": step},
                    os.path.join(a.out, f"weights_{step:06d}.pt"))
 
-    if step == 0:
+    placement_steps = {5000, 10000, 30000, 60000, a.steps}
+    def placement_eval():
+        from .placement_eval import score
+        arm(3)
+        score(a.placement_data, "dev", a.out, step, enc, tgt, pred)
+        if step == a.steps:
+            score(a.placement_data, "seed0", a.out, step, enc, tgt, pred)
+        if step and step % a.eval_every != 0 and step != a.steps:
+            path = os.path.join(a.out, f"weights_{step:06d}.pt")
+            torch.save({"enc":enc.state_dict(), "pred":pred.state_dict(), "tgt":tgt.state_dict(), "step":step}, path+".tmp")
+            os.replace(path+".tmp", path)
+
+    if a.placement_data and (step == 0 or step in placement_steps):
+        placement_eval()
+    if step == 0 or (a.placement_data and step == a.steps and not os.path.exists(os.path.join(a.out, f"weights_{step:06d}.pt"))):
         do_eval()
     enc.train(); pred.train()
     while step < a.steps:
@@ -382,7 +406,10 @@ def main():
                 seglab = corrupt_labels(seglab, a.label_flip, a.label_merge)
         else:
             clips = batch.to(dev, non_blocking=True)
-        kind, ctx, tg = sample_masks(rng, enc.slots, enc.grid, a.p_prefix)
+        if a.placement_data:
+            kind, ctx, tg = placement_mask(batches.cutoffs[step], a.seed, step, enc.slots, enc.grid)
+        else:
+            kind, ctx, tg = sample_masks(rng, enc.slots, enc.grid, a.p_prefix)
         B = clips.shape[0]
         ctx, tg = ctx.to(dev).unsqueeze(0).expand(B, -1), tg.to(dev).unsqueeze(0).expand(B, -1)
         for g in opt.param_groups:
@@ -453,6 +480,8 @@ def main():
             print(f"[train] {json.dumps(rec)}", flush=True)  # every log: cloudrun reads progress from stdout
         if step % a.ckpt_every == 0 or step % a.eval_every == 0 or step == a.steps:
             save_ckpt()
+        if a.placement_data and step in placement_steps:
+            placement_eval()
         if step % a.eval_every == 0 or step == a.steps:
             do_eval()
     faulthandler.cancel_dump_traceback_later()

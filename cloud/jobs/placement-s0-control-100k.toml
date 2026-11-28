@@ -1,6 +1,6 @@
 [job]
 name = "placement-s0-control-100k"
-command = "tar -xf $DATA/placement/evaluation.tar -C $DATA/placement && python -m jepatrain.train --out $RUN_DIR --data $DATA/v4b_128 --placement-data $DATA/placement --placement-arm control --init-ckpt $DATA/init/ckpt_100000.pt --heldout $DATA/heldout_v4b_128/v4b_triples2000_128.pt --res 128 --duty 1.0 --power-ceiling 5000 --workers 10 --auto-resume --loss l2 --pool-weight 1.0 --change-weight 50 --p-prefix 0.8 --steps 100000 --warmup 1000 --lr 1e-4 --eval-every 100000 --ckpt-every 1000 --batch 32 --seed 0"
+command = "tar -xf $DATA/placement/evaluation.tar -C $DATA/placement && python -m jepatrain.train --out $RUN_DIR --data $DATA/v4b_128 --placement-data $DATA/placement --placement-arm control --init-ckpt $DATA/init/ckpt_100000.pt --heldout $DATA/heldout_v4b_128/v4b_triples2000_128.pt --res 128 --duty 1.0 --power-ceiling 5000 --workers 10 --auto-resume --loss l2 --pool-weight 1.0 --change-weight 50 --p-prefix 0.8 --steps 100000 --warmup 1000 --lr 1e-4 --eval-every 100000 --ckpt-every 1000 --batch 32 --seed 0 && CUDA_VISIBLE_DEVICES= python scripts/count_by_n.py $RUN_DIR --weights weights_100000.pt --data $DATA/count --layer 8 --threads 8 --out $RUN_DIR/visible-count-100000.json"
 setup = ["pip install -q webdataset scikit-learn pyarrow pyyaml pydantic"]
 progress_regex = '"step": (\d+)'
 rolling = "ckpt_*.pt"
@@ -21,6 +21,10 @@ local = "placement"
 [[data]]
 remote = "data/placement-s0-init-v1"
 local = "init"
+
+[[data]]
+remote = "data/placement-visible-count-v1"
+local = "count"
 
 [machine]
 # small model (17.8M params, ~13 GB at batch 32); the data loader wants CPU cores, the held-out set ~14 GB RAM

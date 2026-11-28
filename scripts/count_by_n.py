@@ -28,10 +28,11 @@ ap.add_argument("--moved-thresh", type=float, default=0.02,
                 help="motion shortcut test: a box object 'moved' if its max displacement over the clip exceeds this (m)")
 ap.add_argument("--encoder", choices=("context", "target"), default="context",
                 help="read the context encoder or the EMA target encoder (same architecture)")
+ap.add_argument("--threads", type=int, default=40, help="CPU threads for feature extraction and readout fitting")
 a = ap.parse_args()
 if torch.cuda.is_available():
     raise SystemExit("run with CUDA_VISIBLE_DEVICES=")
-torch.set_num_threads(40)
+torch.set_num_threads(a.threads)
 enc, tgt, _p, step = lp.load_run(a.run, a.weights, device="cpu")
 if a.encoder == "target":
     enc = tgt

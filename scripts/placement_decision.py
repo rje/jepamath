@@ -3,7 +3,23 @@
 import argparse
 import json
 from pathlib import Path
-from jepatrain.placement_eval import compare_runs
+
+import numpy as np
+
+from jepatrain.placement_eval import compare_runs, intervals
+
+
+def visible_count(control, treatment):
+    counts = [json.loads(p.read_text()) for p in (control, treatment)]
+    meta = counts[0]["test_meta"]
+    if meta != counts[1]["test_meta"] or len(meta["box"]) != 600 or any(c["step"] != 100000 for c in counts):
+        raise ValueError("unpaired fixed count battery")
+    result = {}
+    for target in ("box", "total"):
+        labels = np.asarray(meta[target])
+        hits = np.array([np.asarray(c[f"xfmr/{target}/pred_int"]) == labels for c in counts], dtype=float)
+        result[target] = dict(control=intervals(hits[0]), treatment=intervals(hits[1]), gain=intervals(hits[1]-hits[0]))
+    return result
 
 
 def main(control, treatment, out):
@@ -20,6 +36,8 @@ def main(control, treatment, out):
         for group, stage in (("landed", "landed"), ("visible", "visible"))
     }
     retention["removal"] = gain["main_carry"][1][0]
+    count = visible_count(*(p.parent / "visible-count-100000.json" for p in (control, treatment)))
+    retention["box_count"] = count["box"]["gain"][0]
     result = dict(
         step=100000,
         scenes=128,
@@ -27,7 +45,9 @@ def main(control, treatment, out):
         treatment_add_pair=score,
         paired_gains=gain,
         real_add_gain=real_add_delta,
+        fixed_visible_count=count,
         retention=retention,
+        retention_pass=all(retention[k] >= -0.05 for k in ("landed", "removal", "box_count")),
         primary_pass=visible and score[1] > 0.60 and gain["main_carry"][0][1] > 0 and real_add_delta > 0,
         fork_treatment=b["summary"]["fork"]["carry"],
         fork_gain=gain["fork_carry"],

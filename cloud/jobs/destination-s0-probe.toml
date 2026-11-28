@@ -1,0 +1,35 @@
+[job]
+name = "destination-s0-probe"
+command = "tar xf $DATA/diagnostic/scenes.tar -C $DATA/diagnostic && OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 python scripts/destination_probe.py $DATA/diagnostic $RUN_DIR --auto-resume"
+setup = ["pip install -q webdataset scikit-learn pyarrow pydantic pyyaml"]
+progress_regex = 'scenes_done (\d+)'
+
+[[data]]
+remote = "data/destination-s0-v1"
+local = "diagnostic"
+
+[machine]
+gpus = ["RTX 3090","RTX 4090"]
+max_price_per_gpu = 0.35
+interruptible = false
+bid_multiplier = 1.25
+min_reliability = 0.98
+min_disk_gb = 32
+min_gpu_ram_gb = 20
+min_ram_gb = 16
+min_cpu_cores = 4
+min_inet_down_mbps = 300
+min_cuda = 12.6
+episode_hours = 0.5
+upload_gb = 0.04
+
+[budget]
+max_spend = 0.47
+max_hours = 1.5
+
+[watch]
+poll_s = 15
+boot_min = 7
+setup_grace_min = 16
+stall_min = 8
+max_failures = 2

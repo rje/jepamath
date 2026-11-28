@@ -27,7 +27,7 @@ def readouts(scores):
 
 
 @torch.inference_mode()
-def scene(z, prefix, enc, tgt, pred, controls):
+def scene(z, prefix, enc, tgt, pred, controls, collect_features=None):
     q = z[prefix + "queries"]
     alts = z[prefix + "alternatives"]
     tok = np.flatnonzero(z[prefix + "box"])
@@ -67,8 +67,11 @@ def scene(z, prefix, enc, tgt, pred, controls):
         if name == "delayed":
             fr = np.concatenate([masked[:, np.arange(7) % 4], masked[:, : ctx - 7]], axis=1)
         n = ctx // 4 * g
+        encoded = enc(tensor(fr))
+        if collect_features is not None:
+            collect_features(name, encoded)
         predout = pred(
-            enc(tensor(fr)),
+            encoded,
             torch.arange(n, device=device).expand(len(q), -1),
             torch.arange(n, 8 * g, device=device).expand(len(q), -1),
         )
